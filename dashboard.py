@@ -1,8 +1,3 @@
-# te_qc_gui.py
-# Wavy Detection — Prototype Dashboard with History/Trend + Data-driven Gauge
-# Built only with Python stdlib + numpy/pandas/matplotlib/sklearn.
-# Integrated waviness class overlays (from Streamlit app) for History & Results pages.
-
 import os, math
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -18,26 +13,19 @@ try:
 except Exception:
     ws_connect = None
 
-APP_TITLE   = "Wavy Detection Prototype Dashboard"
-APP_VERSION = "v0.5"
+APP_TITLE   = "Wavy Detection Dashboard"
+APP_VERSION = "v1.0"
 
-# ---- Force the OD column by exact name ----
-EXACT_OD_COLUMN = "Tag_value"  # <- put your exact Excel header here
-ENFORCE_EXACT_OD = True        # keep True until it plots correctly
-
-
-
+EXACT_OD_COLUMN = "Tag_value"
+ENFORCE_EXACT_OD = True
 
 DATA_COL_GUESSES = {
     "time": ["ts", "time", "timestamp", "date_time", "datetime", "t_stamp"],
     "od":   ["od", "outer_diameter", "tube_od", "ndc_od_value","ndc_system_ovality_value__tag_value", "tag_value"],
 }
 
-# Add this just after DATA_COL_GUESSES
 SECONDARY_COL_GUESSES = {
-    # time column names we’ll try
     "time": ["ts", "time", "timestamp", "date_time", "datetime", "t_stamp"],
-    # likely column names for your “ovality” (or any second metric)
     "val": [
         "ovality", "ovality_value",
         "ndc_system_ovality_value", "ndc_system_ovality_value__tag_value",
@@ -45,13 +33,6 @@ SECONDARY_COL_GUESSES = {
     ],
 }
 
-
-
-def rolling_mad(x):
-    m = np.median(x)
-    return np.mean(np.abs(x - m))
-
-# ---- Wavy class palette (matches your Streamlit app) ----
 CLASS_COLORS = {
     "STEADY":        "#4CAF50",
     "MILD_WAVE":     "#FFB300",
@@ -62,7 +43,6 @@ CLASS_COLORS = {
 }
 
 def pastel(hex_color: str, alpha: float = 0.25) -> str:
-    """Blend an RGB hex color with white by `alpha` (0..1)."""
     hex_color = hex_color.lstrip("#")
     r = int(hex_color[0:2], 16)
     g = int(hex_color[2:4], 16)
@@ -75,14 +55,9 @@ def pastel(hex_color: str, alpha: float = 0.25) -> str:
 
 
 def normalize_label(s) -> str:
-    """
-    Map free-text/ID labels to canonical class keys used for coloring.
-    Returns one of: STEADY, MILD_WAVE, STRONG_WAVE, DRIFT, BURSTY_NOISY, UNCERTAIN
-    """
     if s is None:
         return "UNCERTAIN"
 
-    # Numeric IDs (0..5) and numeric-like strings
     try:
         v = int(float(str(s).strip()))
         id_map = {0: "STEADY", 1: "MILD_WAVE", 2: "STRONG_WAVE", 3: "DRIFT", 4: "BURSTY_NOISY", 5: "UNCERTAIN"}
@@ -118,11 +93,7 @@ def normalize_label(s) -> str:
     }
     return aliases.get(t, "UNCERTAIN")
 
-
-# Optional: quick class visibility hook (no UI yet; modify as needed)
 VISIBLE_CLASSES = set(CLASS_COLORS.keys())
-
-# ========================= Utilities =========================
 
 def pick(colnames, candidates):
     low = [c.lower() for c in colnames]
@@ -131,27 +102,15 @@ def pick(colnames, candidates):
             return colnames[low.index(alias.lower())]
     return None
 
-def try_float(x):
-    try: return float(x)
-    except: return None
-
-# ========================= Data Store =========================
 class DataStore:
-    # ---- Global data store (must exist before pages use it) ----
-
     def __init__(self):
         self.path = None
         self.ts = []       # list[str] raw ts strings
-        self.ts_dt = []    # list[pd.Timestamp] parsed timestamps aligned with self.od
+        self.ts_dt = []    # list[pd.timestamp] parsed timestamps aligned with self.od
         self.od = []       # list[float]
         self.classes = []  # list[dict]: {"start":ts, "end":ts, "label":str, "i0":int, "i1":int}
-        self.last_loaded_rows = 0
                 # secondary / comparison series
-        self.sec_path = None
-        self.sec_name = None
-        self.sec_ts_dt = []   # parsed timestamps (aligned length to sec_vals)
-        self.sec_vals = []    # list[float]
-        self.paired_df = None # pandas DataFrame with columns ["od","sec","t"]
+        self.paired_df = None # pandas dataframe with columns ["od","sec","t"]
 
         self.model = None
         self.window_size = None
@@ -166,13 +125,11 @@ class DataStore:
         self._decim_current_sec = None
         self._decim_vals = []
         self._decim_speed_ok = False
-        self.target_hz = 1  # you can make this configurable later
-        # Whether to decimate high-rate live data to 1 Hz (median per second)
-        self.decimate_enabled = True
-
+        self.target_hz = 1
+        # whether to decimate high-rate live data to 1 Hz (median per second)
+        self.decimate_enabled = False
 
     def _read_any_table(self, path: str, sheet = None):
-        """Return a pandas DataFrame from CSV/XLS/XLSX (first sheet for Excel)."""
         ext = os.path.splitext(path.lower())[1]
         if ext in [".xlsx", ".xls"]:
             if sheet == None:
@@ -181,72 +138,25 @@ class DataStore:
                 return pd.read_excel(path, sheet_name=[sheet, 'YS_Pullout1_Act_Speed_fpm'], parse_dates=[0])
         
     def _smart_to_numeric(self, series: pd.Series) -> pd.Series:
-        """
-        Convert numbers that may be stored as strings with units, commas, or thousands
-        separators into float. Returns a float Series; non-parsable values -> NaN.
-        """
         s = series.copy()
 
-        # If it's already numeric, return as is
         if pd.api.types.is_numeric_dtype(s):
             return pd.to_numeric(s, errors="coerce")
 
-        # Make strings
         s = s.astype(str).str.strip()
 
-        # Remove common unit suffixes and any non-numeric decorations except . , - and exponent
-        # Example: "1.63 mm" -> "1.63", "1,63mm" -> "1,63"
         s = s.str.replace(r"[^\d\.,\-eE+]", "", regex=True)
 
-        # Heuristic: detect decimal comma vs decimal dot
         has_comma = s.str.contains(",", regex=False, na=False).sum()
         has_dot   = s.str.contains(".", regex=False, na=False).sum()
 
-        # If comma appears more commonly than dot, treat comma as decimal separator.
-        # Remove thousand separators accordingly.
         if has_comma > has_dot:
-            # First remove dot thousands separators if any (e.g., "1.234,56" -> "1234,56")
             s = s.str.replace(".", "", regex=False)
-            # Then convert decimal comma to dot
             s = s.str.replace(",", ".", regex=False)
         else:
-            # Treat dot as decimal separator; remove comma thousands separators
-            # e.g., "1,234.56" -> "1234.56"
-            # (Avoid breaking "1,23" if it was decimal comma but rarer than dot overall)
             s = s.str.replace(",", "", regex=False)
 
-        # Final conversion
         return pd.to_numeric(s, errors="coerce")
-
-    def _try_autoshift_classes_to_data_date(self, c: pd.DataFrame) -> pd.DataFrame:
-        """
-        If classes and data have disjoint dates (e.g., classes are 2025-09-26 but
-        OD.xlsx parsed as today's date or only time-of-day), try shifting all class
-        rows by the delta between their first date and the data's first date.
-        Returns a possibly shifted copy of c.
-        """
-        if not len(self.ts_dt):
-            return c
-
-        data_start = min(self.ts_dt)
-        data_end   = max(self.ts_dt)
-
-        # If we already overlap, do nothing.
-        c0, c1 = c["start"].min(), c["end"].max()
-        if not (c1 < data_start or c0 > data_end):
-            return c
-
-        # Compute whole-day shift based on date (ignore time-of-day)
-        try:
-            delta_days = (data_start.normalize() - c0.normalize()).days
-            if abs(delta_days) > 0:  # shift by full days
-                c = c.copy()
-                c["start"] = c["start"] + pd.Timedelta(days=delta_days)
-                c["end"]   = c["end"]   + pd.Timedelta(days=delta_days)
-                App.status(f"Class timestamps auto-shifted by {delta_days} day(s) to match data date.")
-        except Exception:
-            pass
-        return c
     
     def filter_by_speed(self, df_dict):
         speed_df = df_dict['YS_Pullout1_Act_Speed_fpm']
@@ -296,11 +206,10 @@ class DataStore:
         except Exception:
             pass
 
-        self.last_loaded_rows = len(self.od)
         self.path = path
 
         try:
-            App.status(f"Using time='{'t_stamp'}', OD='{'Tag_value'}'. Rows kept: {self.last_loaded_rows}.")
+            App.status(f"Using time='{'t_stamp'}', OD='{'Tag_value'}'")
         except Exception:
             pass
 
@@ -310,33 +219,19 @@ class DataStore:
                 analysis_page = app.pages['Analysis']
                 analysis_page.update_confidence_timeline()
 
-            # Map labels -> an NG risk in [0..1] (tune if you like)
-    CLASS_TO_RISK = {
-        "STEADY":        0.05,
-        "MILD_WAVE":     0.40,
-        "STRONG_WAVE":   0.90,
-        "DRIFT":         0.80,
-        "BURSTY_NOISY":  0.85,
-        "UNCERTAIN":     0.50,
-    }
-
     def _align_series(self, df_main, tcol_main, ycol_main, df_sec, tcol_sec, ycol_sec):
-        """
-        Build an inner-joined (nearest) table of OD and secondary values by time.
-        Returns a DataFrame with columns: ['t','od','sec'].
-        """
-        # Prepare main
+        # prepare main
         m = pd.DataFrame({
             "t": pd.to_datetime(df_main[tcol_main], errors="coerce"),
             "od": self._smart_to_numeric(df_main[ycol_main]),
         }).dropna()
-        # Prepare secondary
+        # prepare secondary
         s = pd.DataFrame({
             "t": pd.to_datetime(df_sec[tcol_sec], errors="coerce"),
             "sec": self._smart_to_numeric(df_sec[ycol_sec]),
         }).dropna()
 
-        # Remove timezone so we can compare
+        # remove timezone
         for col in ["t"]:
             if hasattr(m[col], "dt"):
                 try: m[col] = m[col].dt.tz_convert(None)
@@ -348,8 +243,6 @@ class DataStore:
         m = m.sort_values("t")
         s = s.sort_values("t")
 
-        # If both look evenly sampled, use an asof join with a small tolerance
-        # Tolerance = median step of the faster stream (or 1s fallback).
         tol = pd.Timedelta(seconds=1)
         if len(m) >= 3:
             dtm = (m["t"].diff().dropna().median() or pd.Timedelta(seconds=1))
@@ -403,10 +296,6 @@ class DataStore:
             raise ValueError(f"No overlapping timestamps between OD and '{sheet_name}' after speed filtering.")
 
         self.paired_df = paired
-        self.sec_path = self.path
-        self.sec_name = sheet_name
-        self.sec_ts_dt = paired["t"].tolist()
-        self.sec_vals = paired["sec"].tolist()
 
         App.status(f"Secondary loaded & aligned: {sheet_name} • paired rows={len(self.paired_df)} (speed filtered)")
 
@@ -440,19 +329,6 @@ class DataStore:
 
     def _paired_ok(self):
         return (self.paired_df is not None) and (not self.paired_df.empty)
-
-    def estimate_sample_period_s(self, df=None):
-        """Median seconds between samples from a time column."""
-        if df is None:
-            if not self._paired_ok(): return None
-            df = self.paired_df
-        t = pd.to_datetime(df["t"], errors="coerce").dropna()
-        if len(t) < 3: return None
-        dt = t.diff().dropna().median()
-        try:
-            return float(dt.total_seconds())
-        except Exception:
-            return None
 
     def lag_corr_curve(self, max_lag_samples=300):
         """
@@ -500,97 +376,10 @@ class DataStore:
             rr.append(r)
         return np.array(mids), np.array(rr)
 
-    def current_timestamp(self):
-        """Timestamp of the latest OD sample (pd.Timestamp or None)."""
-        if not self.ts_dt:
-            return None
-        return self.ts_dt[-1]
-
     def current_class(self):
         if not self.classes:
             return None, None
         return self.classes[-1]["label"], self.classes[-1]["risk"]
-
-    def load_classes_from_features(self, path: str):
-        if not os.path.exists(path):
-            raise FileNotFoundError(path)
-        if not self.od or not self.ts_dt:
-            raise ValueError("Load OD data first.")
-        ext = os.path.splitext(path.lower())[1]
-        f = pd.read_excel(path, sheet_name=0) if ext in [".xlsx", ".xls"] else pd.read_csv(path)
-        if f is None or f.empty:
-            self.classes = []; App.status("Features file is empty."); return
-
-        colmap = {str(k).strip().lower(): k for k in f.columns}
-        def pick(*names):
-            for n in names:
-                if n in colmap: return colmap[n]
-            return None
-
-        start_col = pick("start","window_start","timestamp","time_start")
-        end_col   = pick("end","window_end","time_end","stop")
-        label_col = pick("label","class","wave_class","label_name","class_name","state","segment","category")
-        if not start_col: raise ValueError("Features missing a 'start' column.")
-        if not end_col:   raise ValueError("Features missing an 'end' column.")
-
-        f["start"] = pd.to_datetime(f[start_col], errors="coerce")
-        f["end"]   = pd.to_datetime(f[end_col],   errors="coerce")
-        if label_col:
-            f["label"] = f[label_col].astype(str).map(normalize_label)
-        else:
-            f["label"] = "UNCERTAIN"
-
-        # clip to data span
-        f = f.dropna(subset=["start","end"]); f = f[f["end"] > f["start"]].sort_values(["start","end"])
-        smin, smax = min(self.ts_dt), max(self.ts_dt)
-        f["start"] = f["start"].clip(lower=smin, upper=smax)
-        f["end"]   = f["end"].clip(lower=smin, upper=smax)
-        f = f[f["end"] > f["start"]]
-
-                # --- normalize / infer labels ----------------------
-        if label_col:
-            src = f[label_col]
-            # If the column is numeric IDs, map them to names
-            if pd.api.types.is_numeric_dtype(src):
-                id_map = {0:"STEADY", 1:"MILD_WAVE", 2:"STRONG_WAVE", 3:"DRIFT", 4:"BURSTY_NOISY", 5:"UNCERTAIN"}
-                f["label"] = src.map(lambda v: id_map.get(int(v), "UNCERTAIN"))
-            else:
-                f["label"] = src.astype(str).map(normalize_label)
-        else:
-            # Try one-hot columns like STEADY/MILD_WAVE/... if present
-            onehot_cols = [k for k in f.columns if str(k).strip().upper().replace(" ","_") in CLASS_COLORS.keys()]
-            if onehot_cols:
-                def pick_onehot(row):
-                    for k in onehot_cols:
-                        val = row[k]
-                        try:
-                            on = float(val) > 0.5
-                        except Exception:
-                            on = str(val).strip() in ("1","true","True","YES")
-                        if on:
-                            return normalize_label(str(k))
-                    return "UNCERTAIN"
-                f["label"] = f.apply(pick_onehot, axis=1)
-            else:
-                # last resort
-                f["label"] = "UNCERTAIN"
-
-
-        # precompute spans
-        ns = np.array([int(t.value) for t in self.ts_dt], dtype=np.int64)
-        if not (np.all(np.diff(ns) >= 0)):
-            order = np.argsort(ns); ns = ns[order]
-            self.ts_dt = [self.ts_dt[i] for i in order]; self.od = [self.od[i] for i in order]
-
-        spans = []
-        for _, row in f.iterrows():
-            lbl = row["label"] if row["label"] in CLASS_COLORS else "UNCERTAIN"
-            i0 = int(np.searchsorted(ns, int(row["start"].value), side="left"))
-            i1 = int(np.searchsorted(ns, int(row["end"].value),   side="right"))
-            i0 = max(0, min(i0, len(ns)-1)); i1 = max(0, min(i1, len(ns)))
-            if i1 > i0: spans.append({"start": row["start"], "end": row["end"], "label": lbl, "i0": i0, "i1": i1})
-        self.classes = spans
-        App.status(f"Classes from features loaded: {len(self.classes)} spans.")
 
     def extract_features(self, window_data):
         window_data = np.asarray(window_data, dtype=float)
@@ -631,7 +420,7 @@ class DataStore:
         except Exception:
             pass
 
-        # ---- FFT features ----
+        # FFT features
         fft_valid = 0
         fft_peak_freq = 0.0
         fft_peak_prominence = 0.0
@@ -680,40 +469,40 @@ class DataStore:
         if len(self.od) < window_size:
             return
         
-        # Clear existing classes
+        # clear existing classes
         self.classes = []
         
         num_windows = len(self.od) // window_size
 
-        # Collect all features first
+        # collect all features first
         features_list = []
-        window_metadata = []  # Store start/end indices for each window
+        window_metadata = []  # store start/end indices for each window
         
         for i in range(num_windows):
             start_idx = i * window_size
             end_idx = start_idx + window_size
             window = self.od[start_idx:end_idx]
             
-            # Extract features as a dictionary
+            # extract features as a dict
             features_dict = self.extract_features(window)
             features_list.append(features_dict)
             window_metadata.append((start_idx, end_idx))
         
-        # Convert to DataFrame (same as training)
+        # convert to DataFrame (same as training)
         X = pd.DataFrame(features_list)
         
-        # Scale all features at once (same as training)
+        # scale all features at once (same as training)
         # scaler = StandardScaler()
         # X_scaled = scaler.fit_transform(X)
         
-        # Predict for all windows
+        # predict for all windows
         if not features_list:
             return
         probas = self.model.predict_proba(X)
         
-        # Create class segments
+        # create class segments
         for i, (start_idx, end_idx) in enumerate(window_metadata):
-            chatter_confidence = probas[i][1]  # Probability of class 1 (chatter/bad)
+            chatter_confidence = probas[i][1]  # probability of class 1 (chatter/bad)
             
             self.classes.append({
                 "start": self.ts[start_idx],
@@ -749,171 +538,6 @@ class DataStore:
     def trend_slope(self, n=1024):
         y = self.recent_window(n)
         return self._linreg_slope(y) if y else 0.0
-
-    def volatility_p2p(self, n=1024):
-        y = self.recent_window(n)
-        return (max(y) - min(y)) if y else 0.0
-
-    def ng_score(self, n=1024, spec_mm=10.0, spec_band=0.02):
-        """
-        Simple placeholder score in [0..100]:
-          - normalize slope by spec band
-          - normalize peak-to-peak by spec band
-        Combine as weighted sum (tweak weights as needed).
-        """
-        slope = abs(self.trend_slope(n))
-        p2p   = self.volatility_p2p(n)
-        slope_norm = min(1.0, slope / (spec_band/200.0 + 1e-9))
-        p2p_norm   = min(1.0, p2p   / (spec_band*2.0 + 1e-9))
-        score = 100.0 * (0.6 * p2p_norm + 0.4 * slope_norm)
-        return max(0.0, min(100.0, score))
-
-    # ----- class windows support -----
-    # 111111111
-    def _ts_values_ns(self):
-        """Convert timestamps to int64 ns since epoch for fast searchsorted."""
-        out = []
-        for t in self.ts_dt:
-            if isinstance(t, pd.Timestamp) and pd.notna(t):
-                out.append(int(t.value))
-            else:
-                out.append(np.iinfo(np.int64).min)
-        return np.array(out, dtype=np.int64)
-
-    def _time_to_index(self, t: pd.Timestamp):
-        if not isinstance(t, pd.Timestamp) or not len(self.ts_dt):
-            return 0
-        ns = self._ts_values_ns()
-        key = int(t.value)
-        i = np.searchsorted(ns, key, side="left")
-        if i <= 0: return 0
-        if i >= len(ns): return len(ns)-1
-        return i if abs(ns[i]-key) < abs(ns[i-1]-key) else (i-1)
-
-    def load_classes(self, path: str):
-        """
-        Load waviness class segments from CSV/XLS/XLSX.
-        Expected flexible headers:
-        start: start | window_start | timestamp | time_start
-        end:   end | window_end | time_end | stop
-        label: label | class | wave_class
-        Produces self.classes = list of dicts with sample spans {start,end,label,i0,i1}.
-        """
-        if not os.path.exists(path):
-            raise FileNotFoundError(path)
-        if not self.od or not self.ts_dt:
-            raise ValueError("Load OD data first (so we can align class windows to samples).")
-
-        # read table
-        ext = os.path.splitext(path.lower())[1]
-        if ext in [".xlsx", ".xls"]:
-            c = pd.read_excel(path, sheet_name=0)
-        else:
-            c = pd.read_csv(path)
-        if c is None or c.empty:
-            self.classes = []
-            App.status("Classes file is empty.")
-            return
-
-        # helper: column picker on lowercase names
-        colmap = {str(k).strip().lower(): k for k in c.columns}
-        def pick(*names):
-            for n in names:
-                if n in colmap:
-                    return colmap[n]
-            return None
-
-        start_col = pick("start","window_start","timestamp","time_start")
-        end_col   = pick("end","window_end","time_end","stop")
-        label_col = pick("label","class","wave_class","label_name","class_name","state","segment","category")
-        if not start_col:
-            raise ValueError("Classes file missing a 'start' (or equivalent) column.")
-
-        c["start"] = pd.to_datetime(c[start_col], errors="coerce")
-        if end_col:
-            c["end"] = pd.to_datetime(c[end_col], errors="coerce")
-        else:
-            c = c.sort_values("start")
-            gaps = c["start"].diff().dropna()
-            win = gaps.median() if len(gaps) else pd.Timedelta(minutes=5)
-            c["end"] = c["start"].shift(-1)
-            c.loc[c["end"].isna(), "end"] = c["start"] + win
-        # --- normalize / infer labels ----------------------
-        if label_col:
-            src = c[label_col]
-            # If the column is numeric IDs, map them to names
-            if pd.api.types.is_numeric_dtype(src):
-                id_map = {0:"STEADY", 1:"MILD_WAVE", 2:"STRONG_WAVE", 3:"DRIFT", 4:"BURSTY_NOISY", 5:"UNCERTAIN"}
-                c["label"] = src.map(lambda v: id_map.get(int(v), "UNCERTAIN"))
-            else:
-                c["label"] = src.astype(str).map(normalize_label)
-        else:
-            # Try one-hot columns like STEADY/MILD_WAVE/... if present
-            onehot_cols = [k for k in c.columns if str(k).strip().upper().replace(" ","_") in CLASS_COLORS.keys()]
-            if onehot_cols:
-                def pick_onehot(row):
-                    for k in onehot_cols:
-                        val = row[k]
-                        try:
-                            on = float(val) > 0.5
-                        except Exception:
-                            on = str(val).strip() in ("1","true","True","YES")
-                        if on:
-                            return normalize_label(str(k))
-                    return "UNCERTAIN"
-                c["label"] = c.apply(pick_onehot, axis=1)
-            else:
-                # last resort
-                c["label"] = "UNCERTAIN"
-
-        # normalize tz so we can compare with self.ts_dt (which are tz-naive)
-        for col in ["start","end"]:
-            if hasattr(c[col], "dt"):
-                try:    c[col] = c[col].dt.tz_convert(None)
-                except: c[col] = c[col].dt.tz_localize(None)
-
-        # labels
-        if label_col:
-            c["label"] = c[label_col].astype(str).map(normalize_label)
-        else:
-            c["label"] = "UNCERTAIN"
-
-        # clean & sort
-        c = c.dropna(subset=["start","end"])
-        c = c[c["end"] > c["start"]].sort_values(["start","end"]).reset_index(drop=True)
-
-        # --- AUTO-SHIFT if classes & data don't overlap by date ---
-        c = self._try_autoshift_classes_to_data_date(c)
-
-        # clip to data span
-        smin, smax = min(self.ts_dt), max(self.ts_dt)
-        c["start"] = c["start"].clip(lower=smin, upper=smax)
-        c["end"]   = c["end"].clip(lower=smin, upper=smax)
-        c = c[c["end"] > c["start"]]
-
-        # recompute spans on the (maybe shifted) table
-        ns = np.array([int(t.value) for t in self.ts_dt], dtype=np.int64)
-        if not (np.all(np.diff(ns) >= 0)):
-            order = np.argsort(ns)
-            ns = ns[order]
-            self.ts_dt = [self.ts_dt[i] for i in order]
-            self.od    = [self.od[i]    for i in order]
-
-        spans = []
-        for _, row in c.iterrows():
-            lbl = str(row["label"])
-            if lbl not in CLASS_COLORS: lbl = "UNCERTAIN"
-            s_ns = int(row["start"].value); e_ns = int(row["end"].value)
-            i0 = int(np.searchsorted(ns, s_ns, side="left"))
-            i1 = int(np.searchsorted(ns, e_ns, side="right"))
-            i0 = max(0, min(i0, len(ns) - 1))
-            i1 = max(0, min(i1, len(ns)))
-            if i1 <= i0: continue
-            spans.append({"start": row["start"], "end": row["end"], "label": lbl, "i0": i0, "i1": i1})
-
-        self.classes = spans
-        App.status(f"Classes loaded: {len(self.classes)} span(s).")
-
 
     def _append_sample(self, ts_dt, od):
         self.ts_dt.append(ts_dt)
@@ -1004,7 +628,7 @@ class DataStore:
 
 
 DATA = DataStore()
-# ========================= Widgets =========================
+# !!!!!! widgets
 class Gauge(ttk.Frame):
     def __init__(self, parent, width=360, height=200, *args, **kwargs):
         super().__init__(parent, *args, **kwargs)
@@ -1098,10 +722,8 @@ class TrendChart(ttk.Frame):
         dy = -16 if slope > 0 else (16 if slope < 0 else 0)
         self.canvas.create_line(ax-10, ay, ax+10, ay+dy, arrow=tk.LAST, width=3, fill=color)
 
-        # --- CLASS OVERLAYS (stipple ~= alpha) ---
-        # --- CLASS OVERLAYS (shaded bands using stipple ~= alpha) ---
         if getattr(DATA, "classes", None):
-            # Store image references to prevent garbage collection
+            # store image references to prevent garbage collection
             if not hasattr(self, '_overlay_images'):
                 self._overlay_images = []
             self._overlay_images.clear()
@@ -1109,12 +731,11 @@ class TrendChart(ttk.Frame):
             y0 = pad + 1
             y1 = h - pad - 1
             n_total = len(DATA.od)
-            offset = n_total - len(y)  # global index represented by local x==0
+            offset = n_total - len(y)
             
             for seg in DATA.classes:
                 if seg["label"] not in VISIBLE_CLASSES:
                     continue
-                # ----- index clamp that always yields width >= 1 -----
                 i0 = seg["i0"] - offset
                 i1 = seg["i1"] - offset
                 if i1 <= 0 or i0 >= len(y):
@@ -1125,7 +746,7 @@ class TrendChart(ttk.Frame):
                 x0 = X(i0)
                 x1 = X(i1)
                 
-                # Get color and create semi-transparent overlay
+                # get color and create semitransparent overlay
                 color = CLASS_COLORS.get(seg["label"], "#BBBBBB")
                 rgb = self.canvas.winfo_rgb(color)
                 # winfo_rgb returns 16-bit values (0-65535), convert to 8-bit (0-255)
@@ -1134,19 +755,19 @@ class TrendChart(ttk.Frame):
                 b = rgb[2] >> 8
                 alpha = 80  # transparency (0=transparent, 255=opaque)
                 
-                # Create RGBA image with proper dimensions
+                # create RGBA image with proper dimensions
                 width = int(x1 - x0)
                 height = int(y1 - y0)
                 
                 if width > 0 and height > 0:
                     image = Image.new('RGBA', (width, height), (r, g, b, alpha))
                     photo = ImageTk.PhotoImage(image)
-                    self._overlay_images.append(photo)  # Keep reference!
+                    self._overlay_images.append(photo)
                     
-                    # Use x0, y0 with anchor='nw' to position at top-left
+                    # use x0, y0 with anchor='nw' to position at top-left
                     self.canvas.create_image(x0, y0, image=photo, anchor='nw')
                 
-                # Draw label
+                # draw label
                 self.canvas.create_text(x0+4, y0+10, text=seg["label"], anchor="w",
                                         fill="#333333", font=("Segoe UI", 8, "bold"))
 
@@ -1163,7 +784,7 @@ class TrendChart(ttk.Frame):
             self.canvas.create_text(legend_x+18, legend_y + idx*16, text=name, anchor="w",
                                     fill="#111827", font=("Segoe UI", 8))
 
-# ========================= Pages =========================
+# !!! pages
 class BasePage(ttk.Frame):
     def __init__(self, parent, *args, **kwargs):
         super().__init__(parent, padding=16, *args, **kwargs)
@@ -1211,8 +832,8 @@ class DataPage(BasePage):
 
         ttk.Button(controls, text="Connect Live", command=self.connect_live).grid(row=1, column=2, sticky="w", pady=(6,0), padx=(0,8))
         ttk.Button(controls, text="Disconnect",  command=self.disconnect_live).grid(row=1, column=3, sticky="w", pady=(6,0))
-        # Optional decimation toggle (default: on)
-        self.decimate_var = tk.BooleanVar(value=True)
+
+        self.decimate_var = tk.BooleanVar(value=False)
         def _on_decimate_toggle(*_):
             # update global setting and clear any partial bucket
             DATA.decimate_enabled = self.decimate_var.get()
@@ -1270,64 +891,11 @@ class DataPage(BasePage):
                 App.status("Load secondary failed")
                 self.sheet_var.set("Select sheet...")
 
-    def load_classes(self):
-        if not DATA.od:
-            messagebox.showwarning("Load data first", "Please load a data file before loading classes.")
-            return
-        path = filedialog.askopenfilename(
-            title="Select classes file (CSV/XLSX/XLS)",
-            filetypes=[("Data files", "*.csv *.xlsx *.xls"),
-                       ("CSV files", "*.csv"),
-                       ("Excel files", "*.xlsx *.xls"),
-                       ("All files","*.*")]
-        )
-        if not path: return
-        try:
-            DATA.load_classes(path)
-            self.info.config(text=f"{self.info.cget('text')}  •  classes={len(DATA.classes)}")
-            App.status(f"Classes loaded: {os.path.basename(path)}")
-        except Exception as e:
-            messagebox.showerror("Load Classes failed", str(e))
-            App.status("Classes load failed")
-
     def show_corr(self):
         if DATA.paired_df is None or DATA.paired_df.empty:
             messagebox.showinfo("Correlation", "Select a secondary sheet first from the dropdown.")
             return
         CorrelationWindow(self)
-
-
-    def show_diag(self):
-        if not DATA.od:
-            messagebox.showinfo("Diagnostics", "Load a data file first."); return
-        data_min = min(DATA.ts_dt) if DATA.ts_dt else None
-        data_max = max(DATA.ts_dt) if DATA.ts_dt else None
-        n_spans = len(getattr(DATA, "classes", []))
-        cls_min = min([s["start"] for s in DATA.classes]) if n_spans else None
-        cls_max = max([s["end"]   for s in DATA.classes]) if n_spans else None
-        msg = [
-            f"Data rows: {len(DATA.od)}",
-            f"Data time range: {data_min} → {data_max}",
-            f"Class spans: {n_spans}",
-            f"Class time range: {cls_min} → {cls_max}",
-        ]
-        messagebox.showinfo("Diagnostics", "\n".join(msg))
-
-    def load_from_features(self):
-        if not DATA.od:
-            messagebox.showwarning("Load data first", "Please load a data file before features."); return
-        path = filedialog.askopenfilename(
-            title="Select features file (CSV/XLSX/XLS)",
-            filetypes=[("Data files","*.csv *.xlsx *.xls"),("CSV files","*.csv"),
-                    ("Excel files","*.xlsx *.xls"),("All files","*.*")]
-        )
-        if not path: return
-        try:
-            DATA.load_classes_from_features(path)
-            self.info.config(text=f"{self.info.cget('text')}  •  classes={len(DATA.classes)}")
-            App.status(f"Classes (from features) loaded: {os.path.basename(path)}")
-        except Exception as e:
-            messagebox.showerror("Load from Features failed", str(e)); App.status("Load from features failed")
 
     def connect_live(self):
         try:
@@ -1344,12 +912,11 @@ class DataPage(BasePage):
         App.status("Live feed disconnected")
 
     def _poll_live_queue(self):
-        # Drain queue and append samples; decimation optional via checkbox; keep UI snappy
+        # drain queue and append samples
         got = DATA._consume_live_queue()
-        # If a model is selected, you can auto-update classes here, e.g. re-run on latest slice.
-        # For efficiency, do this on a cadence or on a fixed “latest N” buffer, not every single tick.
+        # if a model is selected, we can auto-update classes here
+        # for efficiency, do this on a cadence or on a fixed “latest n” buffer, not every single tick.
         if got and DATA.model is not None and DATA.window_size and len(DATA.od) >= DATA.window_size:
-            # Option A: run every second (simple debounce)
             now = time.time()
             if not hasattr(self, "_last_cls_ts") or now - self._last_cls_ts >= 1.0:
                 DATA.auto_classify(DATA.window_size)
@@ -1424,10 +991,10 @@ class ModelPage(BasePage):
         
         App.status("Computing confidence curves... this may take a moment")
         
-        # Group models by type and window size
+        # group models by type and window size
         model_types = {}  # {model_type: {window_size: model}}
         for model_name, model in self.models.items():
-            # Parse model name: "Model Type (Window Size XX)"
+            # parse model name: "Model Type (Window Size XX)"
             parts = model_name.rsplit(' (Window Size ', 1)
             if len(parts) == 2:
                 model_type = parts[0]
@@ -1437,7 +1004,7 @@ class ModelPage(BasePage):
                     model_types[model_type] = {}
                 model_types[model_type][window_size] = model
         
-        # Compute average confidence for each model type at each window size
+        # compute average confidence for each model type at each window size
         results = {}  # {model_type: ([window_sizes], [avg_confidences])}
         
         for model_type, ws_dict in model_types.items():
@@ -1539,7 +1106,7 @@ class ModelPage(BasePage):
         App.status("Confidence plot reset")
 
 class LiveTimeSeries(ttk.Frame):
-    """Matplotlib live plot with class shading via axvspan."""
+    """matplotlib live plot with class shading via axvspan."""
     def __init__(self, parent):
         super().__init__(parent)
         self.fig = Figure(figsize=(6,3), dpi=100)
@@ -1589,7 +1156,7 @@ class LiveTimeSeries(ttk.Frame):
         
 
     def reset_view(self):
-        """Return to autoscaling and clear any saved manual limits."""
+        """return to autoscaling and clear any saved manual limits."""
         self._user_view_active = False
         self._saved_xlim = None
         self._saved_ylim = None
@@ -1599,7 +1166,7 @@ class LiveTimeSeries(ttk.Frame):
         except Exception:
             pass
         self.canvas.draw_idle()
-        # If you have a toolbar present:
+        # if you have a toolbar present:
         try:
             self.toolbar.update()
         except Exception:
@@ -1727,7 +1294,6 @@ class ResultsPage(BasePage):
         self.pred_conf  = ttk.Label(right_top, text="Confidence: —", style="KPI.TLabel")
         self.pred_conf.pack(anchor="w")
 
-        # NEW: FFT metric label just under Confidence
         self.fft_metric = ttk.Label(
             right_top,
             text="FFT: —",
@@ -1763,11 +1329,9 @@ class ResultsPage(BasePage):
 
         self.gauge.set_value(pct)
 
-        # --- NEW: FFT-based “periodicity strength” metric ---
         fft_info = self._compute_fft_metric(n=24000)
 
         if fft_info is None:
-            # No usable FFT
             self.fft_metric.config(
                 text="FFT: inconclusive (not enough data or flat signal)"
             )
@@ -1777,7 +1341,7 @@ class ResultsPage(BasePage):
         #         text="FFT: inconclusive (no dominant periodic component)"
         #     )
         else:
-            # Clear harmonic found
+            # clear harmonic found
             self.fft_metric.config(
                 text=(
                     f"FFT: peak power {fft_info['peak_power']:.3g} "
@@ -1804,12 +1368,12 @@ class ResultsPage(BasePage):
             # too short for a meaningful FFT
             return None
 
-        # Detrend by removing mean
+        # detrend by removing mean
         y = y - np.mean(y)
         if not np.any(np.isfinite(y)) or np.allclose(y, 0.0, atol=1e-12):
             return None
 
-        # Estimate sampling period from timestamps (fallback to 1 Hz)
+        # estimate sampling period from timestamps (fallback to 1 Hz)
         fs = 1.0
         try:
             if DATA.ts_dt and len(DATA.ts_dt) >= len(y):
@@ -1832,7 +1396,7 @@ class ResultsPage(BasePage):
         if psd.size <= 1:
             return None
 
-        # Ignore DC component at index 0
+        # ignore DC component at index 0
         psd_no_dc = psd[1:]
         freqs_no_dc = freqs[1:]
 
@@ -1846,7 +1410,7 @@ class ResultsPage(BasePage):
 
         prominence = float(peak_power / total_power)
 
-        # Heuristic: require a reasonably dominant peak
+        # heuristic: require a reasonably dominant peak
         periodic = prominence > 0.1
 
         return {
@@ -1883,9 +1447,6 @@ class HistoryPage(BasePage):
         self.after(1000, self._tick)
 
     def _tick(self):
-        slope = DATA.trend_slope(1024)
-        p2p   = DATA.volatility_p2p(1024)
-        score = DATA.ng_score(1024, spec_mm=10.0, spec_band=0.02)
         # self.l_slope.config(text=f"Slope: {slope:0.6f} in/sample")
         # self.l_p2p.config(text=f"Peak-to-peak: {p2p:0.4f} in")
         # self.l_score.config(text=f"Risk score: {score:0.1f}/100")
