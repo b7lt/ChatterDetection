@@ -13,46 +13,56 @@ warnings.filterwarnings('ignore')
 
 speed_threshold = 1
 
-# load data
-df_good_od = pd.read_excel(
-    "data/tagHistoryData_09-01-00_09-09-09.xlsx",
-    sheet_name="NDC_System_OD_Value"
-)
-df_good_od['t_stamp'] = pd.to_datetime(df_good_od['t_stamp'])
+good_datasets = [
+    "../../data/tagHistoryData_09-01-00_09-09-09.xlsx",
+    # add more good data files here:
+    # "../../data/another_good_dataset.xlsx",
+]
 
-df_good_speed = pd.read_excel(
-    "data/tagHistoryData_09-01-00_09-09-09.xlsx",
-    sheet_name="YS_Pullout1_Act_Speed_fpm"
-)
-df_good_speed['t_stamp'] = pd.to_datetime(df_good_speed['t_stamp'])
-df_good_speed = df_good_speed.rename(columns={'Tag_value': 'speed_value'})
+bad_datasets = [
+    "../../data/tagHistoryData_09-24-00_09-26-17 (rejected sample).xlsx",
+    # add more bad data files here:
+    # "../../data/another_bad_dataset.xlsx",
+]
 
-df_good_merged = pd.merge(
-    df_good_od, 
-    df_good_speed[['t_stamp', 'speed_value']], 
-    on="t_stamp", 
-    how="inner")
-df_good_merged = df_good_merged[df_good_merged['speed_value'] > speed_threshold].copy()
+def load_and_merge_dataset(filepath):
+    """load OD and speed data from a single Excel file and merge them."""
+    df_od = pd.read_excel(filepath, sheet_name="NDC_System_OD_Value")
+    df_od['t_stamp'] = pd.to_datetime(df_od['t_stamp'])
+    
+    df_speed = pd.read_excel(filepath, sheet_name="YS_Pullout1_Act_Speed_fpm")
+    df_speed['t_stamp'] = pd.to_datetime(df_speed['t_stamp'])
+    df_speed = df_speed.rename(columns={'Tag_value': 'speed_value'})
+    
+    df_merged = pd.merge(
+        df_od, 
+        df_speed[['t_stamp', 'speed_value']], 
+        on="t_stamp", 
+        how="inner"
+    )
+    df_merged = df_merged[df_merged['speed_value'] > speed_threshold].copy()
+    
+    return df_merged
 
-df_bad_od = pd.read_excel(
-    "data/tagHistoryData_09-24-00_09-26-17 (rejected sample).xlsx",
-    sheet_name="NDC_System_OD_Value"
-)
-df_bad_od['t_stamp'] = pd.to_datetime(df_bad_od['t_stamp'])
+def load_multiple_datasets(dataset_list):
+    """load and concatenate multiple datasets."""
+    all_data = []
+    for filepath in dataset_list:
+        print(f"Loading: {filepath}")
+        df = load_and_merge_dataset(filepath)
+        all_data.append(df)
+        print(f"  Loaded {len(df)} rows")
+    
+    combined_df = pd.concat(all_data, ignore_index=True)
+    print(f"Total rows after combining: {len(combined_df)}\n")
+    return combined_df
 
-df_bad_speed = pd.read_excel(
-    "data/tagHistoryData_09-24-00_09-26-17 (rejected sample).xlsx",
-    sheet_name="YS_Pullout1_Act_Speed_fpm"
-)
-df_bad_speed['t_stamp'] = pd.to_datetime(df_bad_speed['t_stamp'])
-df_bad_speed = df_bad_speed.rename(columns={'Tag_value': 'speed_value'})
+# load all good and bad datasets
+print("Loading good datasets...")
+df_good_merged = load_multiple_datasets(good_datasets)
 
-df_bad_merged = pd.merge(
-    df_bad_od, 
-    df_bad_speed[['t_stamp', 'speed_value']], 
-    on="t_stamp", 
-    how="inner")
-df_bad_merged = df_bad_merged[df_bad_merged['speed_value'] > speed_threshold].copy()
+print("Loading bad datasets...")
+df_bad_merged = load_multiple_datasets(bad_datasets)
 
 def extract_features(window_data):
     mean_val = np.mean(window_data)
