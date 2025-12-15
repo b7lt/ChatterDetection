@@ -12,12 +12,12 @@ fs = 2400.0                  # websocket sample rate [Hz]
 dt_target = 1.0 / fs        # target time step [s]
 
 mean_od = 0.5           # target OD [inches]
-drift_per_ft = 5.0e-05     # slow drift per foot
+drift_per_ft = 3.5e-05     # slow drift per foot
 
 # Chatter patterns (spatial) along the tube
-chatter_wavelengths = [0.5, 1.0, 2.0] # [inches]
+chatter_wavelengths = [1.0, 2.0] # [inches]
 base_amp = 0.002 * (mean_od / 0.50)
-chatter_amps = [1.5 * base_amp, 1.0 * base_amp, 0.7 * base_amp] # [inches]
+chatter_amps = [0.6 * base_amp, 0.7 * base_amp] # [inches]
 
 noise_std_running = 0.0002 * (mean_od / 0.50)   # noise when line is moving [inches]
 noise_std_stopped = 0.00002 * (mean_od / 0.50)  # noise when line is stopped [inches]
@@ -93,9 +93,9 @@ async def simulation_loop():
                 if state == "stopped":
                     state = "running"
                     base_speed_fpm = sample_run_speed()
-                else:
-                    state = "stopped"
-                    base_speed_fpm = 0.0
+                # else:
+                #     state = "stopped"
+                #     base_speed_fpm = 0.0
 
                 seg_dur = sample_segment_duration()
                 next_segment_switch = now + seg_dur

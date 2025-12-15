@@ -9,6 +9,9 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import SVC
 from sklearn.utils import class_weight
 import xgboost as xgb
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from functools import partial
+import multiprocessing as mp
 
 warnings.filterwarnings("ignore")
 
@@ -80,52 +83,24 @@ def make_synthetic_good_bad_multi(
     means=(0.50, 0.75, 1.00),
     n_runs_per_class=3,
 ):
-    """
-    Generate many synthetic runs across several OD means.
-
-    For each mean in `means`, generate:
-      - n_runs_per_class "good" runs
-      - n_runs_per_class "bad" runs
-
-    Good vs bad differ in chatter amplitudes and noise, scaled with mean.
-    Returns:
-      df_good_merged, df_bad_merged
-    """
     good_runs = []
     bad_runs = []
 
+    # Build list of tasks: (mean_od_in, is_good)
+    tasks = []
     for mean_od_in in means:
-        # Scale amplitudes with mean (larger tubes tolerate larger absolute wobble)
-        base_amp = 0.002 * (mean_od_in / 0.50)  # 0.002" at 0.5", scaled up
-
         for _ in range(n_runs_per_class):
-            # GOOD: lower chatter + noise
-            good_runs.append(
-                generate_synthetic_od_series(
-                    fs=fs,
-                    duration_s=duration_s,
-                    mean_od_in=mean_od_in,
-                    speed_fpm=150.0,
-                    drift_per_ft_in=2.0e-05,
-                    chatter_wavelengths_in=[1.0, 2.0],
-                    chatter_amps_in=[0.25 * base_amp, 0.15 * base_amp],
-                    noise_std_in=0.0002 * (mean_od_in / 0.50),
-                )
-            )
+            tasks.append((mean_od_in, True, fs, duration_s))   # good
+            tasks.append((mean_od_in, False, fs, duration_s))  # bad
 
-            # BAD: stronger chatter + noise
-            bad_runs.append(
-                generate_synthetic_od_series(
-                    fs=fs,
-                    duration_s=duration_s,
-                    mean_od_in=mean_od_in,
-                    speed_fpm=150.0,
-                    drift_per_ft_in=5.0e-05,
-                    chatter_wavelengths_in=[0.5, 1.0, 2.0],
-                    chatter_amps_in=[1.5 * base_amp, 1.0 * base_amp, 0.7 * base_amp],
-                    noise_std_in=0.0005 * (mean_od_in / 0.50),
-                )
-            )
+    with ProcessPoolExecutor(max_workers=mp.cpu_count()) as executor:
+        results = list(executor.map(_generate_single_run, tasks))
+
+    for df, is_good in results:
+        if is_good:
+            good_runs.append(df)
+        else:
+            bad_runs.append(df)
 
     df_good = pd.concat(good_runs, ignore_index=True)
     df_bad = pd.concat(bad_runs, ignore_index=True)
@@ -137,6 +112,28 @@ def make_synthetic_good_bad_multi(
 
     return df_good_merged, df_bad_merged
 
+def _generate_single_run(args):
+    """Worker function for parallel data generation."""
+    mean_od_in, is_good, fs, duration_s = args
+    base_amp = 0.002 * (mean_od_in / 0.50)
+
+    if is_good:
+        df = generate_synthetic_od_series(
+            fs=fs, duration_s=duration_s, mean_od_in=mean_od_in,
+            speed_fpm=150.0, drift_per_ft_in=2.0e-05,
+            chatter_wavelengths_in=[1.0, 2.0],
+            chatter_amps_in=[0.25 * base_amp, 0.15 * base_amp],
+            noise_std_in=0.00002,
+        )
+    else:
+        df = generate_synthetic_od_series(
+            fs=fs, duration_s=duration_s, mean_od_in=mean_od_in,
+            speed_fpm=150.0, drift_per_ft_in=5.0e-05,
+            chatter_wavelengths_in=[0.5, 1.0, 2.0],
+            chatter_amps_in=[1.5 * base_amp, 1.0 * base_amp, 0.7 * base_amp],
+            noise_std_in=0.00005,
+        )
+    return df, is_good
 
 # ---------------------------------------------------------------------------
 # Feature extraction (time domain + FFT, mean-aware)
@@ -281,9 +278,9 @@ def main():
     # many means, many runs per class
     df_good_merged, df_bad_merged = make_synthetic_good_bad_multi(
         fs=fs,
-        duration_s=3600.0,
-        means=(0.50, 0.75, 1.00),
-        n_runs_per_class=3,
+        duration_s=36000.0,
+        means=(0.50, 1.00),
+        n_runs_per_class=4,
     )
 
     window_sizes = [1200, 2400, 4800]  # in samples
@@ -292,14 +289,65 @@ def main():
     models_dir = os.path.join(os.path.dirname(script_dir), "models_dummy_multi")
     os.makedirs(models_dir, exist_ok=True)
 
+    # Prepare training tasks: (window_size, model_name)
+    model_names = ["logit", "rf", "svm", "xgboost"]
+    tasks = [(ws, name) for ws in window_sizes for name in model_names]
+
+    # Pre-compute features for each window size (avoid redundant work)
+    window_data = {}
     for ws in window_sizes:
-        models_out = train_model_on_window_size(df_good_merged, df_bad_merged, ws, fs)
-        for model_name, model in models_out.items():
-            filename = f"dummy_{model_name}_ws{ws}.pkl"
-            model_path = os.path.join(models_dir, filename)
-            with open(model_path, "wb") as f:
-                pickle.dump(model, f)
-            print(f"Saved {model_name} (ws={ws}) to {model_path}")
+        good_features, good_labels = create_windows(df_good_merged, label=0, window_size=ws, fs=fs)
+        bad_features, bad_labels = create_windows(df_bad_merged, label=1, window_size=ws, fs=fs)
+        
+        print(f"WS {ws}: {len(good_features)} good windows and {len(bad_features)} bad windows")
+        
+        all_features = good_features + bad_features
+        all_labels = good_labels + bad_labels
+        
+        if all_features:
+            X = pd.DataFrame(all_features)
+            y = np.array(all_labels)
+            sample_weights = class_weight.compute_sample_weight(class_weight="balanced", y=y)
+            window_data[ws] = (X, y, sample_weights)
+
+    # Worker function for training a single model
+    def train_single_model(task):
+        ws, model_name = task
+        if ws not in window_data:
+            return None
+        
+        X, y, sample_weights = window_data[ws]
+        
+        if model_name == "logit":
+            model = LogisticRegression(max_iter=1000, random_state=42, class_weight="balanced")
+        elif model_name == "rf":
+            model = RandomForestClassifier(n_estimators=100, random_state=42, class_weight="balanced")
+        elif model_name == "svm":
+            model = SVC(kernel="rbf", random_state=42, probability=True, class_weight="balanced")
+        elif model_name == "xgboost":
+            model = xgb.XGBClassifier()
+        
+        if model_name == "xgboost":
+            model.fit(X, y, sample_weight=sample_weights)
+        else:
+            model.fit(X, y)
+        
+        return (ws, model_name, model)
+
+    # train models in parallel
+    with ProcessPoolExecutor(max_workers=mp.cpu_count()) as executor:
+        results = list(executor.map(train_single_model, tasks))
+
+    # save models
+    for result in results:
+        if result is None:
+            continue
+        ws, model_name, model = result
+        filename = f"dummy_{model_name}_ws{ws}.pkl"
+        model_path = os.path.join(models_dir, filename)
+        with open(model_path, "wb") as f:
+            pickle.dump(model, f)
+        print(f"Saved {model_name} (ws={ws}) to {model_path}")
 
 
 if __name__ == "__main__":
