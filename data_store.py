@@ -1,0 +1,536 @@
+import os
+import threading, asyncio, json, queue, time
+
+import numpy as np
+import pandas as pd
+
+try:
+    from websockets.asyncio.client import connect as ws_connect
+except Exception:
+    ws_connect = None
+
+from config import SECONDARY_COL_GUESSES, pick
+from status_bar import status
+
+
+class DataStore:
+    def __init__(self):
+        self.path = None
+        self.ts = []       # list[str] raw ts strings
+        self.ts_dt = []    # list[pd.timestamp] parsed timestamps aligned with self.od
+        self.od = []       # list[float]
+        self.classes = []  # list[dict]: {"start":ts, "end":ts, "label":str, "i0":int, "i1":int}
+                # secondary / comparison series
+        self.paired_df = None # pandas dataframe with columns ["od","sec","t"]
+
+        self.model = None
+        self.window_size = None
+
+        self.available_sheets = []
+
+        self.live_url = "ws://localhost:6467"
+        self.live_thread = None
+        self.live_stop = threading.Event()
+        self.live_queue = queue.Queue(maxsize=10000)
+
+        self._decim_current_sec = None
+        self._decim_vals = []
+        self._decim_speed_ok = False
+        self.target_hz = 1
+        # whether to decimate high-rate live data to 1 Hz (median per second)
+        self.decimate_enabled = False
+
+    def _read_any_table(self, path: str, sheet=None):
+        ext = os.path.splitext(path.lower())[1]
+        if ext in [".xlsx", ".xls"]:
+            if sheet is None:
+                return pd.read_excel(path, sheet_name=None, parse_dates=[0])
+            else:
+                return pd.read_excel(path, sheet_name=[sheet, 'YS_Pullout1_Act_Speed_fpm'], parse_dates=[0])
+
+    def _smart_to_numeric(self, series: pd.Series) -> pd.Series:
+        s = series.copy()
+
+        if pd.api.types.is_numeric_dtype(s):
+            return pd.to_numeric(s, errors="coerce")
+
+        s = s.astype(str).str.strip()
+
+        s = s.str.replace(r"[^\d\.,\-eE+]", "", regex=True)
+
+        has_comma = s.str.contains(",", regex=False, na=False).sum()
+        has_dot   = s.str.contains(".", regex=False, na=False).sum()
+
+        if has_comma > has_dot:
+            s = s.str.replace(".", "", regex=False)
+            s = s.str.replace(",", ".", regex=False)
+        else:
+            s = s.str.replace(",", "", regex=False)
+
+        return pd.to_numeric(s, errors="coerce")
+
+    def filter_by_speed(self, df_dict):
+        speed_df = df_dict['YS_Pullout1_Act_Speed_fpm']
+
+        speed_threshold = 1
+
+        mask = speed_df['Tag_value'] > speed_threshold
+        filtered_speed = speed_df[mask]
+        valid_indices = filtered_speed.index
+
+        filtered_dict = {}
+        for sheet_name, df in df_dict.items():
+            if len(df) == 0:
+                continue
+
+            filtered_dict[sheet_name] = df.reindex(valid_indices).reset_index(drop=True)
+
+        return filtered_dict
+
+    def load_data(self, path: str, app=None):
+        if not os.path.exists(path):
+            raise FileNotFoundError(path)
+
+        self.path = path
+
+        ext = os.path.splitext(path.lower())[1]
+        if ext in [".xlsx", ".xls"]:
+            excel_file = pd.ExcelFile(path)
+            self.available_sheets = excel_file.sheet_names
+        else:
+            self.available_sheets = []
+
+        df_dict = self._read_any_table(path, "NDC_System_OD_Value")
+        if df_dict is None or len(df_dict) == 0:
+            raise ValueError("Empty file.")
+
+        filtered_df_dict = self.filter_by_speed(df_dict)
+
+        self.od = filtered_df_dict['NDC_System_OD_Value']['Tag_value'].tolist()
+        self.ts = filtered_df_dict['NDC_System_OD_Value']['t_stamp'].astype(str).tolist()
+        self.ts_dt = pd.to_datetime(filtered_df_dict['NDC_System_OD_Value']['t_stamp'], errors='coerce').tolist()
+
+        try:
+            v = self.od
+            status(f"Using time='{'t_stamp'}', OD='{'Tag_value'}' • rows={len(v)} "
+                   f"• min={v.min():.6g}, max={v.max():.6g}, mean={v.mean():.6g}")
+        except Exception:
+            pass
+
+        self.path = path
+
+        try:
+            status(f"Using time='{'t_stamp'}', OD='{'Tag_value'}'")
+        except Exception:
+            pass
+
+        if self.model is not None and app is not None:
+            self.auto_classify(window_size=self.window_size)
+            if hasattr(app, 'pages') and 'Analysis' in app.pages:
+                analysis_page = app.pages['Analysis']
+                analysis_page.update_confidence_timeline()
+
+    def _align_series(self, df_main, tcol_main, ycol_main, df_sec, tcol_sec, ycol_sec):
+        # prepare main
+        m = pd.DataFrame({
+            "t": pd.to_datetime(df_main[tcol_main], errors="coerce"),
+            "od": self._smart_to_numeric(df_main[ycol_main]),
+        }).dropna()
+        # prepare secondary
+        s = pd.DataFrame({
+            "t": pd.to_datetime(df_sec[tcol_sec], errors="coerce"),
+            "sec": self._smart_to_numeric(df_sec[ycol_sec]),
+        }).dropna()
+
+        # remove timezone
+        for col in ["t"]:
+            if hasattr(m[col], "dt"):
+                try: m[col] = m[col].dt.tz_convert(None)
+                except: m[col] = m[col].dt.tz_localize(None)
+            if hasattr(s[col], "dt"):
+                try: s[col] = s[col].dt.tz_convert(None)
+                except: s[col] = s[col].dt.tz_localize(None)
+
+        m = m.sort_values("t")
+        s = s.sort_values("t")
+
+        tol = pd.Timedelta(seconds=1)
+        if len(m) >= 3:
+            dtm = (m["t"].diff().dropna().median() or pd.Timedelta(seconds=1))
+            tol = max(tol, dtm)
+        if len(s) >= 3:
+            dts = (s["t"].diff().dropna().median() or pd.Timedelta(seconds=1))
+            tol = max(tol, dts)
+
+        paired = pd.merge_asof(m, s, on="t", direction="nearest", tolerance=tol)
+        paired = paired.dropna().reset_index(drop=True)
+        return paired[["t", "od", "sec"]]
+
+    def load_secondary_sheet(self, sheet_name: str):
+        if not self.path:
+            raise ValueError("Load the main data file first.")
+        if not os.path.exists(self.path):
+            raise FileNotFoundError(self.path)
+
+        ext = os.path.splitext(self.path.lower())[1]
+        if ext not in [".xlsx", ".xls"]:
+            raise ValueError("Secondary sheet loading only works with Excel files.")
+
+        df_dict = pd.read_excel(self.path, sheet_name=[sheet_name, 'YS_Pullout1_Act_Speed_fpm'])
+
+        df_sec = df_dict[sheet_name]
+        if df_sec is None or df_sec.empty:
+            raise ValueError(f"Sheet '{sheet_name}' is empty.")
+
+        filtered_dict = self.filter_by_speed(df_dict)
+        df_sec_filtered = filtered_dict[sheet_name]
+
+        cols_s = list(df_sec_filtered.columns)
+        tcol_s = pick(cols_s, SECONDARY_COL_GUESSES["time"]) or "t_stamp"
+        ycol_s = pick(cols_s, SECONDARY_COL_GUESSES["val"]) or "Tag_value"
+
+        if tcol_s not in cols_s:
+            raise ValueError(f"Could not find time column in sheet '{sheet_name}'. Columns: {cols_s}")
+        if ycol_s not in cols_s:
+            raise ValueError(f"Could not find value column in sheet '{sheet_name}'. Columns: {cols_s}")
+
+        df_dict_od = pd.read_excel(self.path, sheet_name=['NDC_System_OD_Value', 'YS_Pullout1_Act_Speed_fpm'])
+        filtered_dict_od = self.filter_by_speed(df_dict_od)
+        df_main_filtered = filtered_dict_od['NDC_System_OD_Value']
+
+        tcol_m = "t_stamp"
+        ycol_m = "Tag_value"
+
+        paired = self._align_series(df_main_filtered, tcol_m, ycol_m,
+                                    df_sec_filtered, tcol_s, ycol_s)
+        if paired.empty:
+            raise ValueError(f"No overlapping timestamps between OD and '{sheet_name}' after speed filtering.")
+
+        self.paired_df = paired
+
+        status(f"Secondary loaded & aligned: {sheet_name} • paired rows={len(self.paired_df)} (speed filtered)")
+
+    def corr_stats(self, max_lag_samples: int = 300):
+        """
+        Compute basic correlation stats between OD and secondary series.
+        Returns dict with: n, pearson_r, best_lag, r_at_best_lag.
+        """
+        if self.paired_df is None or self.paired_df.empty:
+            return {"n": 0, "pearson_r": np.nan, "best_lag": 0, "r_at_best_lag": np.nan}
+
+        x = self.paired_df["od"].to_numpy(dtype=float)
+        y = self.paired_df["sec"].to_numpy(dtype=float)
+        n = min(len(x), len(y))
+        if n < 3:
+            return {"n": n, "pearson_r": np.nan, "best_lag": 0, "r_at_best_lag": np.nan}
+
+        # plain Pearson (no lag)
+        r0 = float(np.corrcoef(x, y)[0, 1])
+
+        # best lag (shift y relative to x)
+        best_r, best_k = r0, 0
+        K = min(max_lag_samples, n - 2)
+        for k in range(1, K + 1):
+            r_pos = float(np.corrcoef(x[k:], y[:-k])[0, 1])
+            if r_pos > best_r: best_r, best_k = r_pos, +k
+            r_neg = float(np.corrcoef(x[:-k], y[k:])[0, 1])
+            if r_neg > best_r: best_r, best_k = r_neg, -k
+
+        return {"n": n, "pearson_r": r0, "best_lag": best_k, "r_at_best_lag": best_r}
+
+    def _paired_ok(self):
+        return (self.paired_df is not None) and (not self.paired_df.empty)
+
+    def lag_corr_curve(self, max_lag_samples=300):
+        """
+        Return lags (in samples) and Pearson r at each lag (y shifted).
+        lags: array from -K..+K, r: same length.
+        """
+        if not self._paired_ok(): return np.array([]), np.array([])
+        x = self.paired_df["od"].to_numpy(dtype=float)
+        y = self.paired_df["sec"].to_numpy(dtype=float)
+        n = min(len(x), len(y))
+        if n < 5: return np.array([]), np.array([])
+        K = int(min(max_lag_samples, n - 3))
+        lags = np.arange(-K, K + 1, dtype=int)
+        r = np.zeros_like(lags, dtype=float)
+        for i, k in enumerate(lags):
+            if k < 0:   # y leads (shift y forward)
+                r[i] = np.corrcoef(x[:k], y[-k:])[0, 1]
+            elif k > 0: # x leads
+                r[i] = np.corrcoef(x[k:], y[:-k])[0, 1]
+            else:
+                r[i] = np.corrcoef(x, y)[0, 1]
+        return lags, r
+
+    def rolling_corr(self, win_samples=200, step=10):
+        """
+        Rolling Pearson r over paired series.
+        Returns arrays (t_mid, r_roll). t_mid are midpoint timestamps of each window.
+        """
+        if not self._paired_ok(): return np.array([]), np.array([])
+        df = self.paired_df
+        x = df["od"].to_numpy(dtype=float)
+        y = df["sec"].to_numpy(dtype=float)
+        t = pd.to_datetime(df["t"], errors="coerce").to_numpy()
+        n = len(df)
+        if n < max(10, win_samples): return np.array([]), np.array([])
+        mids, rr = [], []
+        for i0 in range(0, n - win_samples + 1, step):
+            i1 = i0 + win_samples
+            segx, segy = x[i0:i1], y[i0:i1]
+            if np.std(segx) < 1e-12 or np.std(segy) < 1e-12:
+                r = np.nan
+            else:
+                r = float(np.corrcoef(segx, segy)[0, 1])
+            mids.append(t[i0 + win_samples // 2])
+            rr.append(r)
+        return np.array(mids), np.array(rr)
+
+    def current_class(self):
+        if not self.classes:
+            return None, None
+        return self.classes[-1]["label"], self.classes[-1]["risk"]
+
+    def extract_features(self, window_data):
+        window_data = np.asarray(window_data, dtype=float)
+        mean_val = float(np.mean(window_data))
+        std_val = float(np.std(window_data))
+        ptp_val = float(np.ptp(window_data))
+
+        safe_mean = mean_val if mean_val != 0 else 1e-10
+
+        features = {
+            # absolute scale
+            "mean_od": mean_val,
+            "std_abs": std_val,
+            "range_abs": ptp_val,
+            # relative-to-mean scale
+            "coef_variation": std_val / safe_mean,
+            "relative_range": ptp_val / safe_mean,
+            "normalized_variance": float(np.var(window_data)) / (safe_mean ** 2),
+            "peak_to_peak_ratio": ptp_val / abs(safe_mean),
+            "relative_max_deviation": (float(np.max(window_data)) - mean_val) / safe_mean,
+            "relative_min_deviation": (mean_val - float(np.min(window_data))) / safe_mean,
+            "mean_abs_diff": float(np.mean(np.abs(np.diff(window_data)))) / safe_mean,
+            "max_abs_diff": float(np.max(np.abs(np.diff(window_data)))) / safe_mean,
+        }
+
+        # estimate sampling frequency
+        fs = 2400.0
+        n = len(window_data)
+        try:
+            if self.ts_dt and len(self.ts_dt) >= n:
+                t = pd.to_datetime(self.ts_dt[-n:], errors="coerce")
+                t = t[~pd.isna(t)]
+                if len(t) >= 2:
+                    dt_sec = np.median(
+                        np.diff(t).astype("timedelta64[ns]").astype(np.float64)
+                    ) / 1e9
+                    if dt_sec > 0:
+                        fs = float(1.0 / dt_sec)
+        except Exception:
+            pass
+
+        # FFT features
+        fft_valid = 0
+        fft_peak_freq = 0.0
+        fft_peak_prominence = 0.0
+
+        y = window_data - mean_val
+        if len(y) >= 16 and not np.allclose(y, 0.0, atol=1e-12):
+            nfft = len(y)
+            freqs = np.fft.rfftfreq(nfft, d=1.0 / fs)
+            fft_vals = np.fft.rfft(y)
+            psd = (np.abs(fft_vals) ** 2) / nfft
+
+            if psd.size > 1 and np.any(np.isfinite(psd)):
+                psd_no_dc = psd[1:]
+                freqs_no_dc = freqs[1:]
+                total_power = float(np.sum(psd_no_dc))
+
+                if total_power > 0:
+                    peak_idx = int(np.argmax(psd_no_dc))
+                    peak_power = float(psd_no_dc[peak_idx])
+                    fft_peak_freq = float(freqs_no_dc[peak_idx])
+                    fft_peak_prominence = peak_power / total_power
+
+                    if fft_peak_prominence > 0.30:
+                        fft_valid = 1
+
+        features["fft_valid"] = fft_valid
+        features["fft_peak_freq"] = fft_peak_freq
+        features["fft_peak_prominence"] = fft_peak_prominence
+
+        return features
+
+    def get_label_from_risk_prob(self, risk):
+        if   risk < 0.25: return "STEADY"
+        elif risk < 0.45: return "MILD_WAVE"
+        elif risk < 0.65: return "DRIFT"
+        elif risk < 0.80: return "BURSTY_NOISY"
+        else:             return "STRONG_WAVE"
+
+    def auto_classify(self, window_size=60):
+        if self.model is None:
+            status("No model selected. Please select a model first.")
+            return
+        if window_size is None or window_size <= 0:
+            status("Invalid window size.")
+            return
+        if len(self.od) < window_size:
+            return
+
+        # clear existing classes
+        self.classes = []
+
+        num_windows = len(self.od) // window_size
+
+        # collect all features first
+        features_list = []
+        window_metadata = []  # store start/end indices for each window
+
+        for i in range(num_windows):
+            start_idx = i * window_size
+            end_idx = start_idx + window_size
+            window = self.od[start_idx:end_idx]
+
+            features_dict = self.extract_features(window)
+            features_list.append(features_dict)
+            window_metadata.append((start_idx, end_idx))
+
+        # convert to DataFrame (same as training)
+        X = pd.DataFrame(features_list)
+
+        if not features_list:
+            return
+        probas = self.model.predict_proba(X)
+
+        # create class segments
+        for i, (start_idx, end_idx) in enumerate(window_metadata):
+            chatter_confidence = probas[i][1]  # probability of class 1 (chatter/bad)
+
+            self.classes.append({
+                "start": self.ts[start_idx],
+                "end": self.ts[end_idx - 1] if end_idx > 0 else self.ts[0],
+                "label": self.get_label_from_risk_prob(chatter_confidence),
+                "i0": start_idx,
+                "i1": end_idx,
+                "risk": chatter_confidence
+            })
+
+        status(f"Auto-classes computed: {len(self.classes)} span(s).")
+
+    # ---- math helpers (no numpy) ----
+    @staticmethod
+    def _linreg_slope(y):
+        """Least-squares slope over y with x = 0..n-1 (pure Python)."""
+        n = len(y)
+        if n < 2: return 0.0
+        sx = n * (n - 1) / 2.0
+        sxx = n * (n - 1) * (2 * n - 1) / 6.0
+        sy = sum(y)
+        sxy = sum(i * yi for i, yi in enumerate(y))
+        denom = n * sxx - sx * sx
+        if abs(denom) < 1e-12: return 0.0
+        return (n * sxy - sx * sy) / denom
+
+    def recent_window(self, n=1024):
+        if not self.od: return []
+        n = min(n, len(self.od))
+        return self.od[-n:]
+
+    def trend_slope(self, n=1024):
+        y = self.recent_window(n)
+        return self._linreg_slope(y) if y else 0.0
+
+    def _append_sample(self, ts_dt, od):
+        self.ts_dt.append(ts_dt)
+        self.ts.append(str(ts_dt))
+        self.od.append(float(od))
+
+    def _consume_live_queue(self):
+        """Called from the UI thread (poll) to drain queue. If decimation is enabled,
+        bucket samples into 1-second windows and append the median (≈1 Hz). If disabled,
+        append every sample at its native rate for high-resolution analysis (e.g., FFT)."""
+        drained = 0
+        while True:
+            try:
+                item = self.live_queue.get_nowait()
+            except queue.Empty:
+                break
+            drained += 1
+            ts, od, speed = item  # ts is a float seconds since epoch
+
+            # ---- NON-DECIMATED PATH ----
+            if not getattr(self, "decimate_enabled", True):
+                # Only keep samples while line is actually moving
+                if speed is None or speed <= 1:
+                    continue
+                self._append_sample(pd.to_datetime(ts, unit="s"), od)
+                # Reset any pending decimation bucket so we don't emit a stale median later
+                self._decim_current_sec = None
+                self._decim_vals = []
+                self._decim_speed_ok = False
+                continue
+
+            # ---- DECIMATED PATH (≈1 Hz median, only if speed>1 in that second) ----
+            sec = int(ts)
+            if self._decim_current_sec is None:
+                self._decim_current_sec = sec
+                self._decim_vals = []
+                self._decim_speed_ok = False
+
+            if sec != self._decim_current_sec:
+                # flush previous second
+                if self._decim_speed_ok and self._decim_vals:
+                    import numpy as np
+                    median_od = float(np.median(self._decim_vals))
+                    self._append_sample(pd.to_datetime(self._decim_current_sec, unit="s"), median_od)
+                # start next bucket
+                self._decim_current_sec = sec
+                self._decim_vals = []
+                self._decim_speed_ok = False
+
+            if speed is not None and speed > 1:
+                self._decim_speed_ok = True
+                self._decim_vals.append(od)
+
+        return drained
+
+    def start_live(self, url: str):
+        if ws_connect is None:
+            raise RuntimeError("websockets is not available. Install `websockets` >= 12.")
+        if self.live_thread and self.live_thread.is_alive():
+            return
+        self.live_url = url
+        self.live_stop.clear()
+        self.live_thread = threading.Thread(target=self._run_live_loop, daemon=True)
+        self.live_thread.start()
+
+    def stop_live(self):
+        self.live_stop.set()
+
+    def _run_live_loop(self):
+        asyncio.run(self._live_main())
+
+    async def _live_main(self):
+        while not self.live_stop.is_set():
+            try:
+                async with ws_connect(self.live_url) as ws:
+                    while not self.live_stop.is_set():
+                        msg = await ws.recv()
+                        data = json.loads(msg)
+                        # server sends {"od": float, "speed": int}
+                        od = float(data.get("od", "nan"))
+                        speed = data.get("speed", None)
+                        ts = time.time()
+                        try:
+                            self.live_queue.put_nowait((ts, od, speed))
+                        except queue.Full:
+                            pass
+            except Exception:
+                await asyncio.sleep(0.5)
+
+
+DATA = DataStore()
