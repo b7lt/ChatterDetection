@@ -1,5 +1,5 @@
-APP_TITLE   = "Wavy Detection Dashboard"
-APP_VERSION = "v1.0"
+APP_TITLE   = "Chatter Detection Dashboard"
+APP_VERSION = "v1.1"
 
 SECONDARY_COL_GUESSES = {
     "time": ["ts", "time", "timestamp", "date_time", "datetime", "t_stamp"],

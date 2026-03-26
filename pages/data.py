@@ -124,9 +124,4 @@ class DataPage(BasePage):
             if not hasattr(self, "_last_cls_ts") or now - self._last_cls_ts >= 1.0:
                 DATA.auto_classify(DATA.window_size)
                 self._last_cls_ts = now
-                app_instance = self.winfo_toplevel()
-                if hasattr(app_instance, 'pages') and 'Analysis' in app_instance.pages:
-                    analysis_page = app_instance.pages['Analysis']
-                    analysis_page.update_confidence_timeline()
-
         self.after(100, self._poll_live_queue)

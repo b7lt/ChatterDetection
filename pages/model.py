@@ -20,7 +20,7 @@ except ImportError:
 class ModelPage(BasePage):
     def __init__(self, parent):
         super().__init__(parent)
-        self.headline("Select a model and window size")
+        self.headline("Select Model & Window Size")
 
         self.columnconfigure(0, weight=1)
         self.columnconfigure(1, weight=2)
@@ -29,7 +29,7 @@ class ModelPage(BasePage):
         left_frame = ttk.Frame(self)
         left_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
 
-        ttk.Label(left_frame, text="Select Model:", style="Subhead.TLabel").pack(anchor="w", pady=(0, 4))
+        ttk.Label(left_frame, text="Model Selection (from /models)", style="Subhead.TLabel").pack(anchor="w", pady=(0, 4))
 
         self.models = {}
         self.load_models()
@@ -53,8 +53,8 @@ class ModelPage(BasePage):
 
         ttk.Label(right_frame,
                   text="Average likelihood of chatter being detected in entire dataset (all windows)\n"
-                       "Higher likelihood = chatter likely present\n"
-                       "Lower likelihood = chatter unlikely",
+                       "Higher likelihood = chatter more likely present on average\n"
+                       "Lower likelihood = chatter less likely present on average",
                   style="Subhead.TLabel").pack(anchor="w", pady=(0, 8))
 
         self.fig_conf = Figure(figsize=(8, 5), dpi=100)
@@ -74,9 +74,6 @@ class ModelPage(BasePage):
         DATA.window_size = self._ws_var.get()
         if DATA.od:
             DATA.auto_classify(DATA.window_size)
-            app_instance = self.winfo_toplevel()
-            if hasattr(app_instance, 'pages') and 'Analysis' in app_instance.pages:
-                app_instance.pages['Analysis'].update_confidence_timeline()
         status(f"Model '{name}' selected, window size={DATA.window_size}")
 
     def update_confidence_plot(self):

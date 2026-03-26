@@ -5,11 +5,6 @@ import math
 import tkinter as tk
 from tkinter import ttk
 
-from PIL import Image, ImageTk
-
-from config import CLASS_COLORS, VISIBLE_CLASSES
-from data_store import DATA
-
 
 class Gauge(ttk.Frame):
     # Zones match thresholds in DataStore.get_label_from_risk_prob:
@@ -120,113 +115,6 @@ class Gauge(ttk.Frame):
             label, color = f"Heavy Chatter ({self._pct:0.1f}%)", "#DC2626"
         self._status.config(text=label, foreground=color)
         self._redraw_needle()
-
-
-class TrendChart(ttk.Frame):
-    def __init__(self, parent, *args, **kwargs):
-        super().__init__(parent, *args, **kwargs)
-        self.canvas = tk.Canvas(self, bg="white", highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True)
-        self.bind("<Configure>", lambda e: self.redraw())
-
-    def redraw(self):
-        self.canvas.delete("all")
-        w = max(200, self.canvas.winfo_width())
-        h = max(140, self.canvas.winfo_height())
-        pad = 16
-        self.canvas.create_rectangle(0, 0, w, h, fill="white", outline="")
-        self.canvas.create_rectangle(pad, pad, w - pad, h - pad, outline="#CBD5E1")
-
-        y = DATA.recent_window(1200)
-        if len(y) < 5:
-            self.canvas.create_text(w // 2, h // 2, text="(Load CSV to see history)", fill="#6B7280")
-            return
-
-        ymin, ymax = min(y), max(y)
-        if abs(ymax - ymin) < 1e-9:
-            ymax = ymin + 1.0
-
-        def X(i):  return pad + (w - 2 * pad) * (i / (len(y) - 1))
-        def Y(v):  return h - pad - (h - 2 * pad) * ((v - ymin) / (ymax - ymin))
-
-        # raw line
-        for i in range(1, len(y)):
-            self.canvas.create_line(X(i - 1), Y(y[i - 1]), X(i), Y(y[i]), fill="#93C5FD", width=1)
-
-        # smoothed line
-        k = max(5, len(y) // 50)
-        sm, s = [], 0.0
-        for i, v in enumerate(y):
-            s += v
-            if i >= k: s -= y[i - k]
-            sm.append(s / min(i + 1, k))
-        for i in range(1, len(sm)):
-            self.canvas.create_line(X(i - 1), Y(sm[i - 1]), X(i), Y(sm[i]), fill="#2563EB", width=2)
-
-        # slope badge
-        slope = DATA.trend_slope(min(1024, len(y)))
-        color = "#DC2626" if slope > 0 else ("#16A34A" if slope < 0 else "#6B7280")
-        label = "Uptrend" if slope > 0 else ("Downtrend" if slope < 0 else "Stable")
-        self.canvas.create_text(w - pad - 70, pad + 14, text=label, fill=color, font=("Segoe UI", 10, "bold"))
-        ax = w - pad - 30; ay = pad + 28
-        dy = -16 if slope > 0 else (16 if slope < 0 else 0)
-        self.canvas.create_line(ax - 10, ay, ax + 10, ay + dy, arrow=tk.LAST, width=3, fill=color)
-
-        if getattr(DATA, "classes", None):
-            # store image references to prevent garbage collection
-            if not hasattr(self, '_overlay_images'):
-                self._overlay_images = []
-            self._overlay_images.clear()
-
-            y0 = pad + 1
-            y1 = h - pad - 1
-            n_total = len(DATA.od)
-            offset = n_total - len(y)
-
-            for seg in DATA.classes:
-                if seg["label"] not in VISIBLE_CLASSES:
-                    continue
-                i0 = seg["i0"] - offset
-                i1 = seg["i1"] - offset
-                if i1 <= 0 or i0 >= len(y):
-                    continue
-                i0 = max(0, min(i0, len(y) - 2))
-                i1 = max(i0 + 1, min(i1, len(y) - 1))
-
-                x0 = X(i0)
-                x1 = X(i1)
-
-                color = CLASS_COLORS.get(seg["label"], "#BBBBBB")
-                rgb = self.canvas.winfo_rgb(color)
-                # winfo_rgb returns 16-bit values (0-65535), convert to 8-bit (0-255)
-                r = rgb[0] >> 8
-                g = rgb[1] >> 8
-                b = rgb[2] >> 8
-                alpha = 80  # transparency (0=transparent, 255=opaque)
-
-                width = int(x1 - x0)
-                height = int(y1 - y0)
-
-                if width > 0 and height > 0:
-                    image = Image.new('RGBA', (width, height), (r, g, b, alpha))
-                    photo = ImageTk.PhotoImage(image)
-                    self._overlay_images.append(photo)
-                    self.canvas.create_image(x0, y0, image=photo, anchor='nw')
-
-                # draw label
-                self.canvas.create_text(x0 + 4, y0 + 10, text=seg["label"], anchor="w",
-                                        fill="#333333", font=("Segoe UI", 8, "bold"))
-
-        # legend
-        legend_x = pad + 6
-        legend_y = pad + 10
-        for idx, (name, col) in enumerate(CLASS_COLORS.items()):
-            if name not in VISIBLE_CLASSES: continue
-            self.canvas.create_rectangle(legend_x, legend_y + idx * 16 - 6,
-                                         legend_x + 12, legend_y + idx * 16 + 6,
-                                         fill=col, width=0, stipple="gray25")
-            self.canvas.create_text(legend_x + 18, legend_y + idx * 16, text=name, anchor="w",
-                                    fill="#111827", font=("Segoe UI", 8))
 
 
 class BasePage(ttk.Frame):
