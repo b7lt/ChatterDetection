@@ -726,24 +726,26 @@ class TrainingPage(BasePage):
                     while not self._live_stop.is_set():
                         msg  = await ws.recv()
                         data = json.loads(msg)
-                        # Speed filter: look for any key containing "speed"
-                        speed = next(
-                            (v for k, v in data.items() if "speed" in k.lower()),
-                            None)
-                        if speed is not None and speed <= 1:
-                            continue
-                        # Collect all numeric values, skip timestamp strings
-                        numeric = {
-                            k: float(v)
-                            for k, v in data.items()
-                            if k != "t_stamp" and isinstance(v, (int, float))
-                            and not math.isnan(float(v))
-                        }
-                        if numeric:
-                            try:
-                                self._live_q.put_nowait(numeric)
-                            except queue.Full:
-                                pass
+                        # Server sends batched messages: {"samples": [{...}, ...]}
+                        # Fall back to single-sample format for backwards compatibility.
+                        items = data.get("samples") or [data]
+                        for item in items:
+                            # Speed filter: drop samples where line is stopped
+                            speed = item.get("YS_Pullout1_Act_Speed_fpm")
+                            if speed is not None and speed <= 1:
+                                continue
+                            # Collect NDC_System_OD_Value (and any other numeric fields)
+                            numeric = {
+                                k: float(v)
+                                for k, v in item.items()
+                                if k != "t_stamp" and isinstance(v, (int, float))
+                                and not math.isnan(float(v))
+                            }
+                            if numeric:
+                                try:
+                                    self._live_q.put_nowait(numeric)
+                                except queue.Full:
+                                    pass
             except Exception:
                 await asyncio.sleep(0.5)
 
