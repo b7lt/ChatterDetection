@@ -7,9 +7,8 @@ from config import APP_TITLE, APP_VERSION
 from pages.data import DataPage
 from pages.training import TrainingPage
 from pages.model import ModelPage
-from pages.results import ResultsPage
+from pages.live_page import LivePage
 from pages.history import HistoryPage
-from pages.analysis import AnalysisPage
 
 class App(tk.Tk):
     _status_var = None
@@ -32,20 +31,18 @@ class App(tk.Tk):
             "Data":     DataPage(self.container),
             "Training": TrainingPage(self.container),
             "Model":    ModelPage(self.container),
-            "Results":  ResultsPage(self.container),
+            "Live":      LivePage(self.container),
             "History":  HistoryPage(self.container),
-            "Analysis": AnalysisPage(self.container),
         }
         for p in self.pages.values(): p.grid(row=0, column=0, sticky="nsew")
-        self.show("Results")
+        self.show("Live")
 
         self._build_statusbar()
-        self.bind("<Control-1>", lambda e: self.show("Data"))
-        self.bind("<Control-2>", lambda e: self.show("Training"))
-        self.bind("<Control-3>", lambda e: self.show("Model"))
-        self.bind("<Control-4>", lambda e: self.show("Results"))
-        self.bind("<Control-5>", lambda e: self.show("History"))
-        self.bind("<Control-6>", lambda e: self.show("Analysis"))
+        self.bind("<Control-Key-1>", lambda e: self.show("Data"))
+        self.bind("<Control-Key-2>", lambda e: self.show("Training"))
+        self.bind("<Control-Key-3>", lambda e: self.show("Model"))
+        self.bind("<Control-Key-4>", lambda e: self.show("Live"))
+        self.bind("<Control-Key-5>", lambda e: self.show("History"))
 
     def _init_style(self):
         self.style = ttk.Style(self)
@@ -68,11 +65,10 @@ class App(tk.Tk):
 
     def _build_sidebar(self, parent):
         bar = ttk.Frame(parent, style="Sidebar.TFrame", padding=12)
-        ttk.Label(bar, text="Wavy Detection", foreground="white", background="#111827",
+        ttk.Label(bar, text="Chatter Detection", foreground="white", background="#111827",
                   font=("Segoe UI", 16, "bold")).pack(anchor="w", pady=(0, 16))
-        for name, accel in [("Data", "Ctrl+1"), ("Training", "Ctrl+2"), ("Model", "Ctrl+3"),
-                             ("Results", "Ctrl+4"), ("History", "Ctrl+5"), ("Analysis", "Ctrl+6")]:
-            ttk.Button(bar, text=f"{name}    ({accel})", style="Sidebar.TButton",
+        for name in ["Data", "Training", "Model", "Live", "History"]:
+            ttk.Button(bar, text=name, style="Sidebar.TButton",
                        command=lambda n=name: self.show(n)).pack(fill="x", pady=6)
         ttk.Label(bar, text="", background="#111827").pack(expand=True, fill="both")
         ttk.Label(bar, text=f"{APP_VERSION}", foreground="#9CA3AF", background="#111827").pack(anchor="w")

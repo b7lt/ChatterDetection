@@ -8,10 +8,10 @@ from pages.live import LiveTimeSeries
 from data_store import DATA
 
 
-class ResultsPage(BasePage):
+class LivePage(BasePage):
     def __init__(self, parent):
         super().__init__(parent)
-        self.headline("Results")
+        self.headline("Live Data & Predictions")
 
         grid = ttk.Frame(self); grid.grid(row=1, column=0, sticky="nsew")
         self.columnconfigure(0, weight=1); self.rowconfigure(1, weight=1)
@@ -20,7 +20,7 @@ class ResultsPage(BasePage):
         grid.rowconfigure(0, weight=1)
 
         left = ttk.Frame(grid); left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        ttk.Label(left, text="OD vs Time (Live)", style="Subhead.TLabel").pack(anchor="w")
+        ttk.Label(left, text="Live OD", style="Subhead.TLabel").pack(anchor="w")
         self.live = LiveTimeSeries(left)
         self.live.pack(fill="both", expand=True, pady=(6, 0))
 
