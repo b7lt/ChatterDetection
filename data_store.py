@@ -26,6 +26,8 @@ class DataStore:
         self.ts = []       # list[str] raw ts strings
         self.ts_dt = []    # list[pd.timestamp] parsed timestamps aligned with self.od
         self.od = []       # list[float]
+        self.od_hist = []  # ~1 Hz downsampled, never trimmed; used for history display
+        self.ts_hist = []  # pd.Timestamp per od_hist sample
         self.classes = []  # list[dict]: {"start":ts, "end":ts, "label":str, "i0":int, "i1":int}
                 # secondary / comparison series
         self.paired_df = None # pandas dataframe with columns ["od","sec","t"]
@@ -43,9 +45,18 @@ class DataStore:
         self._decim_current_sec = None
         self._decim_vals = []
         self._decim_speed_ok = False
+        self._hist_current_sec = None  # 1Hz accumulator for od_hist
+        self._hist_vals = []
         self.target_hz = 1
         # whether to decimate high-rate live data to 1 Hz (median per second)
         self.decimate_enabled = False
+
+        # Live-buffer cap: keep at most _MAX_LIVE samples; older samples are
+        # dropped from the front and counted in _trim_offset so that class
+        # i0/i1 indices (stored as absolute sample numbers) stay correct.
+        self._trim_offset = 0
+        self._MAX_LIVE = 500_000   # samples kept in memory
+        self._TRIM_TO  = 400_000   # trim back to this size when cap is hit
 
     def _read_any_table(self, path: str, sheet=None):
         ext = os.path.splitext(path.lower())[1]
@@ -116,6 +127,22 @@ class DataStore:
         self.od = filtered_df_dict['NDC_System_OD_Value']['Tag_value'].tolist()
         self.ts = filtered_df_dict['NDC_System_OD_Value']['t_stamp'].astype(str).tolist()
         self.ts_dt = pd.to_datetime(filtered_df_dict['NDC_System_OD_Value']['t_stamp'], errors='coerce').tolist()
+        self.classes = []
+        self._trim_offset = 0
+
+        # Build 1Hz historical buffer from loaded data
+        self.od_hist = []
+        self.ts_hist = []
+        self._hist_current_sec = None
+        self._hist_vals = []
+        try:
+            df_h = pd.DataFrame({'t': self.ts_dt, 'od': self.od})
+            df_h['t'] = pd.to_datetime(df_h['t'])
+            df_h = df_h.set_index('t').resample('1s').median().dropna().reset_index()
+            self.od_hist = df_h['od'].tolist()
+            self.ts_hist = df_h['t'].tolist()
+        except Exception:
+            pass
 
         try:
             v = self.od
@@ -133,9 +160,6 @@ class DataStore:
 
         if self.model is not None and app is not None:
             self.auto_classify(window_size=self.window_size)
-            if hasattr(app, 'pages') and 'Analysis' in app.pages:
-                analysis_page = app.pages['Analysis']
-                analysis_page.update_confidence_timeline()
 
     def _align_series(self, df_main, tcol_main, ycol_main, df_sec, tcol_sec, ycol_sec):
         # prepare main
@@ -332,7 +356,10 @@ class DataStore:
         if len(self.od) < window_size:
             return
 
-        num_windows = len(self.od) // window_size
+        # i0/i1 are stored as absolute sample indices (never reset by trimming).
+        # Convert to local buffer indices via self._trim_offset.
+        total_abs = len(self.od) + self._trim_offset
+        num_windows = total_abs // window_size
 
         # If window_size changed, start fresh
         if self.classes and self.classes[0]["i1"] - self.classes[0]["i0"] != window_size:
@@ -345,28 +372,32 @@ class DataStore:
         windows = []
         window_metadata = []
         for i in range(already_classified, num_windows):
-            start_idx = i * window_size
-            end_idx = start_idx + window_size
-            windows.append(self.od[start_idx:end_idx])
-            window_metadata.append((start_idx, end_idx))
+            abs_start = i * window_size
+            abs_end   = abs_start + window_size
+            local_start = abs_start - self._trim_offset
+            local_end   = abs_end   - self._trim_offset
+            if local_start < 0 or local_end > len(self.od):
+                continue  # data trimmed or incomplete window
+            windows.append(self.od[local_start:local_end])
+            window_metadata.append((abs_start, abs_end, local_start, local_end))
 
         if not windows:
             return
 
         probas = self._cnn_infer(windows)
 
-        for i, (start_idx, end_idx) in enumerate(window_metadata):
+        for i, (abs_start, abs_end, local_start, local_end) in enumerate(window_metadata):
             chatter_confidence = float(probas[i][1])  # class 1 = chatter
             self.classes.append({
-                "start": self.ts[start_idx],
-                "end": self.ts[end_idx - 1] if end_idx > 0 else self.ts[0],
+                "start": self.ts[local_start],
+                "end": self.ts[local_end - 1],
                 "label": self.get_label_from_risk_prob(chatter_confidence),
-                "i0": start_idx,
-                "i1": end_idx,
+                "i0": abs_start,   # absolute index
+                "i1": abs_end,     # absolute index
                 "risk": chatter_confidence
             })
 
-        status(f"Auto-classes computed: {len(self.classes)} span(s).")
+        status(f"Auto-classes computed: {len(self.classes)}")
 
     # ---- math helpers (no numpy) ----
     @staticmethod
@@ -395,6 +426,14 @@ class DataStore:
         self.ts_dt.append(ts_dt)
         self.ts.append(str(ts_dt))
         self.od.append(float(od))
+        # Drop oldest samples in a batch when the cap is hit so list-delete
+        # cost is amortised (one O(n) shift every _MAX_LIVE - _TRIM_TO appends).
+        if len(self.od) > self._MAX_LIVE:
+            excess = len(self.od) - self._TRIM_TO
+            del self.od[:excess]
+            del self.ts[:excess]
+            del self.ts_dt[:excess]
+            self._trim_offset += excess
 
     def _consume_live_queue(self):
         """Called from the UI thread (poll) to drain queue. If decimation is enabled,
@@ -408,6 +447,19 @@ class DataStore:
                 break
             drained += 1
             ts, od, speed = item  # ts is a float seconds since epoch
+
+            # ---- ALWAYS maintain 1Hz historical buffer (never trimmed) ----
+            hist_sec = int(ts)
+            if self._hist_current_sec is None:
+                self._hist_current_sec = hist_sec
+            if hist_sec != self._hist_current_sec:
+                if self._hist_vals:
+                    self.od_hist.append(float(np.median(self._hist_vals)))
+                    self.ts_hist.append(pd.to_datetime(self._hist_current_sec, unit='s'))
+                self._hist_current_sec = hist_sec
+                self._hist_vals = []
+            if speed is not None and speed > 1:
+                self._hist_vals.append(od)
 
             # ---- NON-DECIMATED PATH ----
             if not getattr(self, "decimate_enabled", True):
@@ -431,7 +483,6 @@ class DataStore:
             if sec != self._decim_current_sec:
                 # flush previous second
                 if self._decim_speed_ok and self._decim_vals:
-                    import numpy as np
                     median_od = float(np.median(self._decim_vals))
                     self._append_sample(pd.to_datetime(self._decim_current_sec, unit="s"), median_od)
                 # start next bucket

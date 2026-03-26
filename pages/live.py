@@ -1,8 +1,6 @@
-import tkinter as tk
 from tkinter import ttk
 
 import numpy as np
-import pandas as pd
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 
@@ -82,23 +80,27 @@ class LiveTimeSeries(ttk.Frame):
             xlim = ylim = None
         self.ax.clear()
         if not DATA.od:
-            self.ax.text(0.5, 0.5, "(Load CSV to see live plot)", ha="center", va="center")
+            self.ax.text(0.5, 0.5, "(Load Data to see live plot)", ha="center", va="center")
             self.ax.axis("off")
             self.canvas.draw(); return
 
-        y = np.asarray(DATA.od[-24000:])
+        y = np.asarray(DATA.od[-72000:])
         x = np.arange(len(y))
         self.ax.plot(x, y, linewidth=1.0, alpha=0.7, label="OD")
 
-        # simple smoothing
+        # simple smoothing — numpy cumsum is much cheaper than pd.rolling
         k = max(5, len(y) // 50)
         if len(y) >= k:
-            sm = pd.Series(y).rolling(k, min_periods=1).mean().values
+            cs = np.cumsum(np.insert(y, 0, 0.0))
+            sm = (cs[k:] - cs[:-k]) / k
+            # pad the leading edge so lengths match
+            pad = np.full(k - 1, sm[0])
+            sm = np.concatenate([pad, sm])
             self.ax.plot(x, sm, linewidth=2.0, label="smooth")
 
-        # class shading (convert global i0/i1 to local indices)
+        # class shading (convert absolute i0/i1 to local indices in y)
         if getattr(DATA, "classes", None):
-            n_total = len(DATA.od)
+            n_total = len(DATA.od) + getattr(DATA, '_trim_offset', 0)
             offset = n_total - len(y)
             for seg in DATA.classes:
                 if seg["label"] not in VISIBLE_CLASSES:
@@ -113,7 +115,7 @@ class LiveTimeSeries(ttk.Frame):
                 c = CLASS_COLORS.get(seg["label"], "#BBBBBB")
                 self.ax.axvspan(i0, i1, facecolor=c, alpha=0.25, linewidth=0)
 
-        self.ax.set_title("OD vs Samples — live")
+        self.ax.set_title("OD of Incoming Samples")
         self.ax.set_xlabel("sample index")
         self.ax.set_ylabel("OD (inches)")
 
@@ -141,8 +143,7 @@ class LiveTimeSeries(ttk.Frame):
 
         self.ax.legend(handles, labels, loc="upper left", fontsize=8)
         self.fig.tight_layout()
-        self.canvas.draw()
-        self.toolbar.update()
+        self.canvas.draw_idle()
 
     def _tick(self):
         current_len = len(DATA.od)
@@ -151,7 +152,6 @@ class LiveTimeSeries(ttk.Frame):
         if (current_len != self._last_len or
                 current_classes != getattr(self, '_last_classes_len', -1)):
             self._draw()
-            self.toolbar.update()
             self._last_len = current_len
             self._last_classes_len = current_classes
 

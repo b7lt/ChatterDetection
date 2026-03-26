@@ -35,7 +35,7 @@ class AnalysisPage(BasePage):
                      ha="center", va="center", fontsize=12, color='#6B7280')
         self.ax.axis("off")
         self.fig.tight_layout()
-        self.canvas.draw()
+        self.canvas.draw_idle()
 
         # FFT figure: latest time window FFT
         self.fft_fig = Figure(figsize=(10, 3), dpi=100)
@@ -47,12 +47,16 @@ class AnalysisPage(BasePage):
                          ha="center", va="center", fontsize=11, color="#6B7280")
         self.fft_ax.set_axis_off()
         self.fft_fig.tight_layout()
-        self.fft_canvas.draw()
+        self.fft_canvas.draw_idle()
 
+        self._fft_last_len = -1
         self.after(1500, self._tick_fft)
 
     def _tick_fft(self):
-        self.update_fft_plot(n=24000)
+        current_len = len(DATA.od)
+        if current_len != self._fft_last_len:
+            self.update_fft_plot(n=24000)
+            self._fft_last_len = current_len
         self.after(1500, self._tick_fft)
 
     def update_confidence_timeline(self):
@@ -64,49 +68,18 @@ class AnalysisPage(BasePage):
             messagebox.showinfo("No Model", "Please select a model first.")
             return
 
-        status("Computing confidence timeline.")
+        if not DATA.classes:
+            return
 
         self._overlay_images.clear()
         self.ax.clear()
 
         ws = DATA.window_size
-        num_windows = len(DATA.od) // ws
 
-        if num_windows < 1:
-            self.ax.text(0.5, 0.5, "Not enough data for the selected window size",
-                         ha="center", va="center", fontsize=12)
-            self.ax.axis("off")
-            self.canvas.draw()
-            return
-
-        confidences = []
-        window_times = []
-
-        if not DATA.ts_dt:
-            DATA.ts_dt = pd.to_datetime(DATA.ts, errors='coerce').tolist()
-            if not DATA.ts_dt or all(pd.isna(t) for t in DATA.ts_dt):
-                DATA.ts_dt = [pd.Timestamp.now() + pd.Timedelta(seconds=i) for i in range(len(DATA.od))]
-
-        windows = []
-        for i in range(num_windows):
-            start_idx = i * ws
-            end_idx = start_idx + ws
-            if end_idx > len(DATA.od):
-                break
-            windows.append(DATA.od[start_idx:end_idx])
-            mid_idx = start_idx + ws // 2
-            window_times.append(DATA.ts_dt[mid_idx] if mid_idx < len(DATA.ts_dt) else DATA.ts_dt[-1])
-
-        if windows:
-            probas = DATA._cnn_infer(windows)
-            confidences = (probas[:, 1] * 100).tolist()
-
-        if not confidences:
-            self.ax.text(0.5, 0.5, "Not enough data to compute timeline",
-                         ha="center", va="center", fontsize=12)
-            self.ax.axis("off")
-            self.canvas.draw()
-            return
+        # Read directly from DATA.classes — risk and timestamps are already stored
+        # there by auto_classify, so no CNN inference is needed here.
+        window_times = pd.to_datetime([c["start"] for c in DATA.classes], errors="coerce")
+        confidences  = [c["risk"] * 100.0 for c in DATA.classes]
 
         self.ax.plot(window_times, confidences, label="Chatter likelihood", color="#2563EB", linewidth=2)
 
@@ -139,7 +112,7 @@ class AnalysisPage(BasePage):
         self.ax.legend(handles, labels, loc="upper right", fontsize=8)
 
         self.fig.tight_layout()
-        self.canvas.draw()
+        self.canvas.draw_idle()
 
         self.status_lbl.config(text=f"Timeline updated: {len(confidences)} windows analyzed")
         status(f"Confidence timeline computed for {len(confidences)} windows")
@@ -155,7 +128,7 @@ class AnalysisPage(BasePage):
             self.fft_ax.text(0.5, 0.5, "No data loaded", ha="center", va="center", fontsize=11)
             self.fft_ax.set_axis_off()
             self.fft_fig.tight_layout()
-            self.fft_canvas.draw()
+            self.fft_canvas.draw_idle()
             return
 
         y = np.asarray(DATA.recent_window(n), dtype=float)
@@ -163,7 +136,7 @@ class AnalysisPage(BasePage):
             self.fft_ax.text(0.5, 0.5, "Not enough samples for FFT", ha="center", va="center", fontsize=11)
             self.fft_ax.set_axis_off()
             self.fft_fig.tight_layout()
-            self.fft_canvas.draw()
+            self.fft_canvas.draw_idle()
             return
 
         y = y - np.mean(y)
@@ -171,7 +144,7 @@ class AnalysisPage(BasePage):
             self.fft_ax.text(0.5, 0.5, "FFT inconclusive (flat signal)", ha="center", va="center", fontsize=11)
             self.fft_ax.set_axis_off()
             self.fft_fig.tight_layout()
-            self.fft_canvas.draw()
+            self.fft_canvas.draw_idle()
             return
 
         # Estimate sampling rate from OD timestamps (fallback to 1 Hz)
@@ -198,7 +171,7 @@ class AnalysisPage(BasePage):
             self.fft_ax.text(0.5, 0.5, "FFT inconclusive", ha="center", va="center", fontsize=11)
             self.fft_ax.set_axis_off()
             self.fft_fig.tight_layout()
-            self.fft_canvas.draw()
+            self.fft_canvas.draw_idle()
             return
 
         # Ignore DC bin when plotting and measuring
@@ -228,4 +201,4 @@ class AnalysisPage(BasePage):
             )
 
         self.fft_fig.tight_layout()
-        self.fft_canvas.draw()
+        self.fft_canvas.draw_idle()
