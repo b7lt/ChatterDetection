@@ -9,6 +9,13 @@ try:
 except Exception:
     ws_connect = None
 
+try:
+    import torch
+    import torch.nn as nn
+    _TORCH_OK = True
+except ImportError:
+    _TORCH_OK = False
+
 from config import SECONDARY_COL_GUESSES, pick
 from status_bar import status
 
@@ -292,77 +299,23 @@ class DataStore:
             return None, None
         return self.classes[-1]["label"], self.classes[-1]["risk"]
 
-    def extract_features(self, window_data):
-        window_data = np.asarray(window_data, dtype=float)
-        mean_val = float(np.mean(window_data))
-        std_val = float(np.std(window_data))
-        ptp_val = float(np.ptp(window_data))
-
-        safe_mean = mean_val if mean_val != 0 else 1e-10
-
-        features = {
-            # absolute scale
-            "mean_od": mean_val,
-            "std_abs": std_val,
-            "range_abs": ptp_val,
-            # relative-to-mean scale
-            "coef_variation": std_val / safe_mean,
-            "relative_range": ptp_val / safe_mean,
-            "normalized_variance": float(np.var(window_data)) / (safe_mean ** 2),
-            "peak_to_peak_ratio": ptp_val / abs(safe_mean),
-            "relative_max_deviation": (float(np.max(window_data)) - mean_val) / safe_mean,
-            "relative_min_deviation": (mean_val - float(np.min(window_data))) / safe_mean,
-            "mean_abs_diff": float(np.mean(np.abs(np.diff(window_data)))) / safe_mean,
-            "max_abs_diff": float(np.max(np.abs(np.diff(window_data)))) / safe_mean,
-        }
-
-        # estimate sampling frequency
-        fs = 2400.0
-        n = len(window_data)
-        try:
-            if self.ts_dt and len(self.ts_dt) >= n:
-                t = pd.to_datetime(self.ts_dt[-n:], errors="coerce")
-                t = t[~pd.isna(t)]
-                if len(t) >= 2:
-                    dt_sec = np.median(
-                        np.diff(t).astype("timedelta64[ns]").astype(np.float64)
-                    ) / 1e9
-                    if dt_sec > 0:
-                        fs = float(1.0 / dt_sec)
-        except Exception:
-            pass
-
-        # FFT features
-        fft_valid = 0
-        fft_peak_freq = 0.0
-        fft_peak_prominence = 0.0
-
-        y = window_data - mean_val
-        if len(y) >= 16 and not np.allclose(y, 0.0, atol=1e-12):
-            nfft = len(y)
-            freqs = np.fft.rfftfreq(nfft, d=1.0 / fs)
-            fft_vals = np.fft.rfft(y)
-            psd = (np.abs(fft_vals) ** 2) / nfft
-
-            if psd.size > 1 and np.any(np.isfinite(psd)):
-                psd_no_dc = psd[1:]
-                freqs_no_dc = freqs[1:]
-                total_power = float(np.sum(psd_no_dc))
-
-                if total_power > 0:
-                    peak_idx = int(np.argmax(psd_no_dc))
-                    peak_power = float(psd_no_dc[peak_idx])
-                    fft_peak_freq = float(freqs_no_dc[peak_idx])
-                    fft_peak_prominence = peak_power / total_power
-
-                    if fft_peak_prominence > 0.30:
-                        fft_valid = 1
-
-        features["fft_valid"] = fft_valid
-        features["fft_peak_freq"] = fft_peak_freq
-        features["fft_peak_prominence"] = fft_peak_prominence
-
-        return features
+    def _cnn_infer(self, windows_list):
+        """
+        Run the loaded CNN over a list of raw OD windows.
+        Each window is z-score normalised per-sample (matches training).
+        Returns ndarray shape (N, num_classes); column 1 = chatter probability.
+        """
+        import torch
+        self.model.eval()
+        segs = []
+        for w in windows_list:
+            seg = np.asarray(w, dtype=np.float32)
+            mu, sigma = seg.mean(), seg.std()
+            seg = (seg - mu) / (sigma + 1e-8)
+            segs.append(seg)
+        X = torch.tensor(np.stack(segs), dtype=torch.float32).unsqueeze(1)
+        with torch.no_grad():
+            return self.model(X).numpy()
 
     def get_label_from_risk_prob(self, risk):
         if   risk < 0.25: return "STEADY"
@@ -381,34 +334,24 @@ class DataStore:
         if len(self.od) < window_size:
             return
 
-        # clear existing classes
         self.classes = []
 
         num_windows = len(self.od) // window_size
-
-        # collect all features first
-        features_list = []
-        window_metadata = []  # store start/end indices for each window
-
+        windows = []
+        window_metadata = []
         for i in range(num_windows):
             start_idx = i * window_size
             end_idx = start_idx + window_size
-            window = self.od[start_idx:end_idx]
-
-            features_dict = self.extract_features(window)
-            features_list.append(features_dict)
+            windows.append(self.od[start_idx:end_idx])
             window_metadata.append((start_idx, end_idx))
 
-        # convert to DataFrame (same as training)
-        X = pd.DataFrame(features_list)
-
-        if not features_list:
+        if not windows:
             return
-        probas = self.model.predict_proba(X)
 
-        # create class segments
+        probas = self._cnn_infer(windows)
+
         for i, (start_idx, end_idx) in enumerate(window_metadata):
-            chatter_confidence = probas[i][1]  # probability of class 1 (chatter/bad)
+            chatter_confidence = float(probas[i][1])  # class 1 = chatter
 
             self.classes.append({
                 "start": self.ts[start_idx],
@@ -521,14 +464,20 @@ class DataStore:
                     while not self.live_stop.is_set():
                         msg = await ws.recv()
                         data = json.loads(msg)
-                        # server sends {"od": float, "speed": int}
-                        od = float(data.get("od", "nan"))
-                        speed = data.get("speed", None)
-                        ts = time.time()
-                        try:
-                            self.live_queue.put_nowait((ts, od, speed))
-                        except queue.Full:
-                            pass
+                        # server may send a batch: {"samples": [{...}, ...]}
+                        # or a single sample for backwards compatibility
+                        items = data.get("samples") or [data]
+                        recv_ts = time.time()
+                        for i, item in enumerate(items):
+                            od = float(item.get("NDC_System_OD_Value", "nan"))
+                            speed = item.get("YS_Pullout1_Act_Speed_fpm", None)
+                            # back-calculate timestamps so samples are evenly spaced
+                            n = len(items)
+                            ts = recv_ts - (n - 1 - i) * (1.0 / 2400.0)
+                            try:
+                                self.live_queue.put_nowait((ts, od, speed))
+                            except queue.Full:
+                                pass
             except Exception:
                 await asyncio.sleep(0.5)
 

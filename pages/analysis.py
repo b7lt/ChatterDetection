@@ -87,23 +87,19 @@ class AnalysisPage(BasePage):
             if not DATA.ts_dt or all(pd.isna(t) for t in DATA.ts_dt):
                 DATA.ts_dt = [pd.Timestamp.now() + pd.Timedelta(seconds=i) for i in range(len(DATA.od))]
 
+        windows = []
         for i in range(num_windows):
             start_idx = i * ws
             end_idx = start_idx + ws
             if end_idx > len(DATA.od):
                 break
-
-            window = DATA.od[start_idx:end_idx]
-            features_dict = DATA.extract_features(window)
-            X = pd.DataFrame([features_dict])
-            probas = DATA.model.predict_proba(X)
-            confidences.append(probas[0, 1] * 100)
-
+            windows.append(DATA.od[start_idx:end_idx])
             mid_idx = start_idx + ws // 2
-            if mid_idx < len(DATA.ts_dt):
-                window_times.append(DATA.ts_dt[mid_idx])
-            else:
-                window_times.append(DATA.ts_dt[-1])
+            window_times.append(DATA.ts_dt[mid_idx] if mid_idx < len(DATA.ts_dt) else DATA.ts_dt[-1])
+
+        if windows:
+            probas = DATA._cnn_infer(windows)
+            confidences = (probas[:, 1] * 100).tolist()
 
         if not confidences:
             self.ax.text(0.5, 0.5, "Not enough data to compute timeline",
