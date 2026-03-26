@@ -318,11 +318,9 @@ class DataStore:
             return self.model(X).numpy()
 
     def get_label_from_risk_prob(self, risk):
-        if   risk < 0.25: return "STEADY"
-        elif risk < 0.45: return "MILD_WAVE"
-        elif risk < 0.65: return "DRIFT"
-        elif risk < 0.80: return "BURSTY_NOISY"
-        else:             return "STRONG_WAVE"
+        if   risk < 0.40: return "No Chatter"
+        elif risk < 0.70: return "Mild Chatter"
+        else:             return "Heavy Chatter"
 
     def auto_classify(self, window_size=60):
         if self.model is None:
@@ -334,12 +332,19 @@ class DataStore:
         if len(self.od) < window_size:
             return
 
-        self.classes = []
-
         num_windows = len(self.od) // window_size
+
+        # If window_size changed, start fresh
+        if self.classes and self.classes[0]["i1"] - self.classes[0]["i0"] != window_size:
+            self.classes = []
+
+        already_classified = len(self.classes)
+        if already_classified >= num_windows:
+            return  # nothing new to classify
+
         windows = []
         window_metadata = []
-        for i in range(num_windows):
+        for i in range(already_classified, num_windows):
             start_idx = i * window_size
             end_idx = start_idx + window_size
             windows.append(self.od[start_idx:end_idx])
@@ -352,7 +357,6 @@ class DataStore:
 
         for i, (start_idx, end_idx) in enumerate(window_metadata):
             chatter_confidence = float(probas[i][1])  # class 1 = chatter
-
             self.classes.append({
                 "start": self.ts[start_idx],
                 "end": self.ts[end_idx - 1] if end_idx > 0 else self.ts[0],

@@ -11,12 +11,9 @@ SECONDARY_COL_GUESSES = {
 }
 
 CLASS_COLORS = {
-    "STEADY":        "#4CAF50",
-    "MILD_WAVE":     "#FFB300",
-    "STRONG_WAVE":   "#E53935",
-    "DRIFT":         "#2196F3",
-    "BURSTY_NOISY":  "#8E24AA",
-    "UNCERTAIN":     "#9E9E9E",
+    "No Chatter":    "#16A34A",
+    "Mild Chatter":  "#D97706",
+    "Heavy Chatter": "#DC2626",
 }
 
 VISIBLE_CLASSES = set(CLASS_COLORS.keys())
