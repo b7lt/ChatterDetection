@@ -146,29 +146,34 @@ class TrainingPage(BasePage):
         ctrl = ttk.Frame(self)
         ctrl.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 4))
 
+        ctrl_row1 = ttk.Frame(ctrl)
+        ctrl_row1.pack(side="top", fill="x")
+        ctrl_row2 = ttk.Frame(ctrl)
+        ctrl_row2.pack(side="top", fill="x", pady=(2, 0))
+
         # data source
-        src_f = ttk.LabelFrame(ctrl, text="Data Source", padding=(6, 3))
+        src_f = ttk.LabelFrame(ctrl_row1, text="Data Source", padding=(6, 3))
         src_f.pack(side="left", padx=(0, 6), fill="y")
         ttk.Button(src_f, text="Import XLSX…", command=self._import_xlsx).grid(
             row=0, column=0, padx=(0, 4))
         ttk.Label(src_f, text="WS URL:").grid(row=0, column=1, padx=(8, 2))
         self._ws_url = tk.StringVar(value="ws://localhost:6467")
-        ttk.Entry(src_f, textvariable=self._ws_url, width=24).grid(row=0, column=2)
+        ttk.Entry(src_f, textvariable=self._ws_url, width=22).grid(row=0, column=2)
         ttk.Button(src_f, text="Connect",
                    command=self._connect_ws).grid(row=0, column=3, padx=(4, 0))
         ttk.Button(src_f, text="Disconnect",
                    command=self._disconnect_ws).grid(row=0, column=4, padx=(2, 0))
 
         # variable selector
-        var_f = ttk.LabelFrame(ctrl, text="Plot Variable", padding=(6, 3))
+        var_f = ttk.LabelFrame(ctrl_row1, text="Plot Variable", padding=(6, 3))
         var_f.pack(side="left", padx=(0, 6), fill="y")
         self._col_combo = ttk.Combobox(var_f, textvariable=self._col_var,
-                                        state="readonly", width=24, height=25)
+                                        state="readonly", width=20, height=25)
         self._col_combo.pack(pady=2)
         self._col_combo.bind("<<ComboboxSelected>>", lambda _: self._redraw_plot())
 
         # label selector
-        lbl_f = ttk.LabelFrame(ctrl, text="Window Label  (drag on plot)", padding=(6, 3))
+        lbl_f = ttk.LabelFrame(ctrl_row1, text="Window Label  (drag on plot)", padding=(6, 3))
         lbl_f.pack(side="left", padx=(0, 6), fill="y")
         for val, txt in [("no_label",   "No Label"),
                          ("no_chatter", "No Chatter"),
@@ -177,7 +182,7 @@ class TrainingPage(BasePage):
                             value=val).pack(side="left", padx=6)
 
         # model / training
-        mdl_f = ttk.LabelFrame(ctrl, text="Model & Training", padding=(6, 3))
+        mdl_f = ttk.LabelFrame(ctrl_row2, text="Model & Training", padding=(6, 3))
         mdl_f.pack(side="left", fill="y")
         c = 0
         ttk.Button(mdl_f, text="Import Model…",
