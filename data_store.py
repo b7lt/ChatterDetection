@@ -34,6 +34,7 @@ class DataStore:
 
         self.model = None
         self.window_size = None
+        self._classified_with_model = None  # tracks which model last classified
 
         self.available_sheets = []
 
@@ -361,8 +362,11 @@ class DataStore:
         total_abs = len(self.od) + self._trim_offset
         num_windows = total_abs // window_size
 
-        # If window_size changed, start fresh
-        if self.classes and self.classes[0]["i1"] - self.classes[0]["i0"] != window_size:
+        # If window_size or model changed, start fresh
+        if self.classes and (
+            self.classes[0]["i1"] - self.classes[0]["i0"] != window_size
+            or self._classified_with_model is not self.model
+        ):
             self.classes = []
 
         already_classified = len(self.classes)
@@ -397,6 +401,7 @@ class DataStore:
                 "risk": chatter_confidence
             })
 
+        self._classified_with_model = self.model
         status(f"Auto-classes computed: {len(self.classes)}")
 
     # ---- math helpers (no numpy) ----
