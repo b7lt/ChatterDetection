@@ -23,12 +23,15 @@ class HistoryPage(BasePage):
         # Toggle controls
         controls = ttk.Frame(self)
         controls.grid(row=1, column=0, sticky="ew", pady=(0, 4))
-        self._show_od   = tk.BooleanVar(value=True)
-        self._show_conf = tk.BooleanVar(value=True)
+        self._show_od      = tk.BooleanVar(value=True)
+        self._show_conf    = tk.BooleanVar(value=True)
+        self._show_windows = tk.BooleanVar(value=True)
         ttk.Checkbutton(controls, text="Show OD",
-                        variable=self._show_od,   command=self._redraw).pack(side="left", padx=(0, 16))
+                        variable=self._show_od,      command=self._redraw).pack(side="left", padx=(0, 16))
         ttk.Checkbutton(controls, text="Show Chatter Likelihood",
-                        variable=self._show_conf, command=self._redraw).pack(side="left")
+                        variable=self._show_conf,    command=self._redraw).pack(side="left", padx=(0, 16))
+        ttk.Checkbutton(controls, text="Show Class Windows",
+                        variable=self._show_windows, command=self._redraw).pack(side="left")
 
         # Matplotlib figure with twin y-axes
         self.fig = Figure(figsize=(12, 6), dpi=100)
@@ -101,8 +104,9 @@ class HistoryPage(BasePage):
         self.ax1.clear()
         self.ax2.clear()
 
-        show_od   = self._show_od.get()   and bool(DATA.od_hist)
-        show_conf = self._show_conf.get() and bool(DATA.classes)
+        show_od      = self._show_od.get()      and bool(DATA.od_hist)
+        show_conf    = self._show_conf.get()    and bool(DATA.classes)
+        show_windows = self._show_windows.get() and bool(DATA.classes)
 
         if not DATA.od_hist and not DATA.classes:
             self._show_placeholder()
@@ -124,8 +128,8 @@ class HistoryPage(BasePage):
         else:
             self.ax1.yaxis.set_visible(False)
 
-        # ---- Likelihood line + shaded bands (right axis) ------------
-        if show_conf and DATA.classes:
+        # ---- Likelihood line (right axis) ---------------------------
+        if show_conf:
             window_times = pd.to_datetime([c["start"] for c in DATA.classes], errors="coerce")
             confidences  = [c["risk"] * 100.0 for c in DATA.classes]
             self.ax2.plot(window_times, confidences,
@@ -133,8 +137,11 @@ class HistoryPage(BasePage):
             self.ax2.set_ylabel("Chatter Likelihood (%)", color="#F97316", fontsize=10)
             self.ax2.tick_params(axis='y', labelcolor="#F97316")
             self.ax2.set_ylim([0, 110])
+        else:
+            self.ax2.yaxis.set_visible(False)
 
-            # Merge consecutive same-label spans → fewer axvspan calls
+        # ---- Shaded class-window bands (left axis) ------------------
+        if show_windows:
             merged = []
             for span in DATA.classes:
                 lbl = span.get("label", "")
@@ -156,8 +163,6 @@ class HistoryPage(BasePage):
                 self.ax1.axvspan(t0, t1,
                                  facecolor=pastel(color, 0.3),
                                  alpha=0.4, linewidth=0, zorder=0)
-        else:
-            self.ax2.yaxis.set_visible(False)
 
         # ---- Unified legend -----------------------------------------
         handles, labels = [], []
@@ -167,10 +172,11 @@ class HistoryPage(BasePage):
         if show_conf:
             handles.append(Line2D([0], [0], color="#F97316", linewidth=1.5))
             labels.append("Chatter Likelihood (%)")
-        for name, color in CLASS_COLORS.items():
-            if name in VISIBLE_CLASSES:
-                handles.append(Patch(facecolor=pastel(color, 0.3), edgecolor="none"))
-                labels.append(name)
+        if show_windows:
+            for name, color in CLASS_COLORS.items():
+                if name in VISIBLE_CLASSES:
+                    handles.append(Patch(facecolor=pastel(color, 0.3), edgecolor="none"))
+                    labels.append(name)
         if handles:
             self.ax1.legend(handles, labels, loc="upper left", fontsize=8)
 
