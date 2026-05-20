@@ -38,8 +38,8 @@ RUN_SPEED_MAX_FPM = 220.0
 RUN_SPEED_JITTER_STD = 3.0  # small jitter around the "constant" speed
 
 # Chatter burst timing
-CHATTER_INTERVAL_MIN = 50.0   # [s] minimum time between chatter bursts
-CHATTER_INTERVAL_MAX = 70.0   # [s] maximum time between chatter bursts
+CHATTER_INTERVAL_MIN = 25.0   # [s] minimum time between chatter bursts
+CHATTER_INTERVAL_MAX = 45.0   # [s] maximum time between chatter bursts
 CHATTER_DURATION = 10.0       # [s] how long each burst lasts
 
 
