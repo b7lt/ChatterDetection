@@ -93,7 +93,6 @@ class LiveTimeSeries(ttk.Frame):
         if len(y) >= k:
             cs = np.cumsum(np.insert(y, 0, 0.0))
             sm = (cs[k:] - cs[:-k]) / k
-            # pad the leading edge so lengths match
             pad = np.full(k - 1, sm[0])
             sm = np.concatenate([pad, sm])
             self.ax.plot(x, sm, linewidth=2.0, label="smooth")
@@ -119,7 +118,6 @@ class LiveTimeSeries(ttk.Frame):
         self.ax.set_xlabel("sample index")
         self.ax.set_ylabel("OD (inches)")
 
-        # Build legend with both line plots AND class overlays
         handles, labels = self.ax.get_legend_handles_labels()
 
         if getattr(DATA, "classes", None):

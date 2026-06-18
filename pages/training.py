@@ -260,9 +260,12 @@ class TrainingPage(BasePage):
         ttk.Button(win_panel, text="Clear All",
                    command=self._clear_all_windows).grid(
             row=2, column=0, sticky="ew", pady=1)
+        ttk.Button(win_panel, text="Auto-label Unlabeled…",
+                   command=self._autolabel_unlabeled).grid(
+            row=3, column=0, sticky="ew", pady=(6, 1))
         self._count_lbl = ttk.Label(win_panel, text="", foreground="#374151",
                                      font=("Segoe UI", 9))
-        self._count_lbl.grid(row=3, column=0, sticky="w", pady=(4, 0))
+        self._count_lbl.grid(row=4, column=0, sticky="w", pady=(4, 0))
 
     # ── Source helpers ────────────────────────────────────────────────────────
 
@@ -487,6 +490,112 @@ class TrainingPage(BasePage):
             return
         self._windows.clear()
         self._refresh_win_list(); self._redraw_plot(); self._check_train_ready()
+
+    def _autolabel_unlabeled(self):
+        """
+        Cluster all currently-unlabeled window slots into two groups by the
+        variance of their OD segment, then assign:
+            high-variance cluster  →  "chatter"
+            low-variance cluster   →  "no_chatter"
+
+        Uses a pure-numpy 1-D k-means (k=2) so there is no sklearn dependency.
+        Already-labeled windows are left untouched.
+        """
+        col = self._col_var.get()
+        ws  = self._ws_size.get()
+
+        if not self._sources or not col:
+            messagebox.showinfo("Auto-label", "Import data and select a plot variable first.")
+            return
+
+        # Build the set of already-labeled (i0, i1) pairs for fast lookup
+        labeled_set = {(w["i0"], w["i1"]) for w in self._windows}
+
+        # Collect unlabeled window slots and their OD variance
+        candidates = []   # list of (global_i0, global_i1, variance)
+
+        for src_idx, src in enumerate(self._sources):
+            if col not in src["series"]:
+                continue
+            arr    = np.asarray(src["series"][col], dtype=np.float32)
+            offset = self._offset_of(src_idx)
+            n      = src["length"]
+
+            for i0_local in range(0, n - ws + 1, ws):
+                i1_local   = i0_local + ws
+                global_i0  = offset + i0_local
+                global_i1  = offset + i1_local
+
+                if (global_i0, global_i1) in labeled_set:
+                    continue   # already has a label — skip
+
+                seg = arr[i0_local:i1_local]
+                valid = seg[~np.isnan(seg)]
+                if len(valid) < ws // 4:
+                    continue   # too many NaNs to be meaningful
+
+                candidates.append((global_i0, global_i1, float(np.var(valid))))
+
+        if not candidates:
+            messagebox.showinfo("Auto-label",
+                                "No unlabeled windows found.\n"
+                                "All window slots are either already labeled "
+                                "or contain insufficient data.")
+            return
+
+        if len(candidates) < 2:
+            # Only one window — assign by comparing its variance to zero
+            g_i0, g_i1, var = candidates[0]
+            lbl = "chatter" if var > 0 else "no_chatter"
+            self._set_window(g_i0, g_i1, lbl)
+            self._refresh_win_list(); self._redraw_plot(); self._check_train_ready()
+            self._update_info()
+            status(f"Auto-labeled 1 window as '{lbl}' (only 1 candidate)")
+            return
+
+        variances = np.array([c[2] for c in candidates], dtype=np.float64)
+
+        # ── 1-D k-means (k=2) ────────────────────────────────────────────────
+        # Initialise centres at the 25th and 75th percentiles so they start
+        # well-separated even when the distribution is heavily skewed.
+        c_lo = float(np.percentile(variances, 25))
+        c_hi = float(np.percentile(variances, 75))
+        if c_lo == c_hi:
+            # All variances identical — fall back to median split
+            c_lo = float(variances.min())
+            c_hi = float(variances.max())
+
+        for _ in range(40):   # 40 iterations is always more than enough for 1-D
+            dist_lo  = np.abs(variances - c_lo)
+            dist_hi  = np.abs(variances - c_hi)
+            labels   = np.where(dist_lo <= dist_hi, 0, 1)   # 0=low, 1=high
+
+            new_lo = float(variances[labels == 0].mean()) if np.any(labels == 0) else c_lo
+            new_hi = float(variances[labels == 1].mean()) if np.any(labels == 1) else c_hi
+
+            if abs(new_lo - c_lo) < 1e-12 and abs(new_hi - c_hi) < 1e-12:
+                break   # converged
+            c_lo, c_hi = new_lo, new_hi
+
+        # Cluster 1 (higher centre) = chatter, cluster 0 = no_chatter
+        chatter_cluster = 1 if c_hi >= c_lo else 0
+
+        n_chatter = n_no_chatter = 0
+        for (g_i0, g_i1, _), cluster in zip(candidates, labels):
+            lbl = "chatter" if cluster == chatter_cluster else "no_chatter"
+            self._set_window(g_i0, g_i1, lbl)
+            if lbl == "chatter":  n_chatter     += 1
+            else:                 n_no_chatter  += 1
+
+        self._refresh_win_list()
+        self._redraw_plot()
+        self._check_train_ready()
+        self._update_info()
+        status(
+            f"Auto-labeled {len(candidates)} unlabeled window(s): "
+            f"{n_chatter} chatter, {n_no_chatter} no-chatter  "
+            f"(variance split: ≤{c_lo:.2e} → no-chatter, >{c_lo:.2e} → chatter)"
+        )
 
     # ── XLSX import ───────────────────────────────────────────────────────────
 

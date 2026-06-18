@@ -24,22 +24,26 @@ from models import CONTEXT_TAGS, N_CONTEXT
 class DataStore:
     def __init__(self):
         self.path = None
-        self.ts = []       # list[str] raw ts strings
-        self.ts_dt = []    # list[pd.timestamp] parsed timestamps aligned with self.od
-        self.od = []       # list[float]
-        self.od_hist = []  # ~1 Hz downsampled, never trimmed; used for history display
-        self.ts_hist = []  # pd.Timestamp per od_hist sample
-        self.classes = []  # list[dict]: {"start":ts, "end":ts, "label":str, "i0":int, "i1":int}
-                # secondary / comparison series
-        self.paired_df = None # pandas dataframe with columns ["od","sec","t"]
+        self.ts = []
+        self.ts_dt = []
+        self.od = []
+        self.od_hist = []       # 1 Hz downsampled OD, never trimmed
+        self.ts_hist = []       # pd.Timestamp per od_hist sample
+        self.ctx_hist: dict = {tag: [] for tag in CONTEXT_TAGS}
+                                # 1 Hz downsampled context, parallel to od_hist/ts_hist
+        self.classes = []
 
-        # Context signal storage — parallel to self.od
-        # Keys = CONTEXT_TAGS; populated from WebSocket feed or XLSX sheets.
-        self.context_data: dict[str, list[float]] = {tag: [] for tag in CONTEXT_TAGS}
+        self.paired_df = None
+
+        # Context signal storage — parallel to self.od (same length, same trim)
+        self.context_data: dict = {tag: [] for tag in CONTEXT_TAGS}
+
+        # Latest values of every field arriving over WebSocket, for KPI display
+        self.live_snapshot: dict = {}
 
         self.model = None
         self.window_size = None
-        self._classified_with_model = None  # tracks which model last classified
+        self._classified_with_model = None
 
         self.available_sheets = []
 
@@ -50,10 +54,14 @@ class DataStore:
 
         self._decim_current_sec = None
         self._decim_vals = []
-        self._decim_ctx_vals: dict[str, list] = {}   # context accumulator for decimated path
+        self._decim_ctx_vals: dict = {}
         self._decim_speed_ok = False
+
+        # 1 Hz historical buffer accumulators
         self._hist_current_sec = None
         self._hist_vals = []
+        self._hist_ctx_vals: dict = {}
+
         self.target_hz = 1
         self.decimate_enabled = False
 
@@ -69,20 +77,17 @@ class DataStore:
             if sheet is None:
                 return pd.read_excel(path, sheet_name=None, parse_dates=[0])
             else:
-                # Always read OD + speed; also read any context sheets present in the file
                 xl = pd.ExcelFile(path)
                 available = set(xl.sheet_names)
                 sheets_to_read = [sheet, "YS_Pullout1_Act_Speed_fpm"]
                 for tag in CONTEXT_TAGS:
                     if tag in available:
                         sheets_to_read.append(tag)
-                # Deduplicate while preserving order
                 seen = set()
-                unique_sheets = [s for s in sheets_to_read
-                                 if not (s in seen or seen.add(s))]
-                return pd.read_excel(path, sheet_name=unique_sheets, parse_dates=[0])
+                unique = [s for s in sheets_to_read if not (s in seen or seen.add(s))]
+                return pd.read_excel(path, sheet_name=unique, parse_dates=[0])
 
-    def _smart_to_numeric(self, series: pd.Series) -> pd.Series:
+    def _smart_to_numeric(self, series):
         s = series.copy()
         if pd.api.types.is_numeric_dtype(s):
             return pd.to_numeric(s, errors="coerce")
@@ -98,9 +103,8 @@ class DataStore:
         return pd.to_numeric(s, errors="coerce")
 
     def filter_by_speed(self, df_dict):
-        speed_df = df_dict["YS_Pullout1_Act_Speed_fpm"]
-        mask     = speed_df["Tag_value"] > 1
-        valid_indices = speed_df[mask].index
+        speed_df      = df_dict["YS_Pullout1_Act_Speed_fpm"]
+        valid_indices = speed_df[speed_df["Tag_value"] > 1].index
         filtered = {}
         for sheet_name, df in df_dict.items():
             if len(df) == 0:
@@ -111,13 +115,11 @@ class DataStore:
     def load_data(self, path: str, app=None):
         if not os.path.exists(path):
             raise FileNotFoundError(path)
-
         self.path = path
 
         ext = os.path.splitext(path.lower())[1]
         if ext in [".xlsx", ".xls"]:
-            excel_file = pd.ExcelFile(path)
-            self.available_sheets = excel_file.sheet_names
+            self.available_sheets = pd.ExcelFile(path).sheet_names
         else:
             self.available_sheets = []
 
@@ -125,36 +127,35 @@ class DataStore:
         if df_dict is None or len(df_dict) == 0:
             raise ValueError("Empty file.")
 
-        filtered_df_dict = self.filter_by_speed(df_dict)
+        filtered = self.filter_by_speed(df_dict)
 
-        self.od    = filtered_df_dict["NDC_System_OD_Value"]["Tag_value"].tolist()
-        self.ts    = filtered_df_dict["NDC_System_OD_Value"]["t_stamp"].astype(str).tolist()
+        self.od    = filtered["NDC_System_OD_Value"]["Tag_value"].tolist()
+        self.ts    = filtered["NDC_System_OD_Value"]["t_stamp"].astype(str).tolist()
         self.ts_dt = pd.to_datetime(
-            filtered_df_dict["NDC_System_OD_Value"]["t_stamp"], errors="coerce"
-        ).tolist()
+            filtered["NDC_System_OD_Value"]["t_stamp"], errors="coerce").tolist()
         self.classes      = []
         self._trim_offset = 0
 
-        # ── Populate context_data from whichever context sheets are present ──
+        # ── Context data from sheet tabs ──────────────────────────────────────
         self.context_data = {tag: [] for tag in CONTEXT_TAGS}
         n_od = len(self.od)
         for tag in CONTEXT_TAGS:
-            if tag in filtered_df_dict:
-                df_ctx = filtered_df_dict[tag]
+            if tag in filtered:
+                df_ctx = filtered[tag]
                 vals = (df_ctx["Tag_value"].tolist()
                         if "Tag_value" in df_ctx.columns else [])
-                # Pad or trim to match OD length
                 if len(vals) < n_od:
                     vals = vals + [0.0] * (n_od - len(vals))
                 self.context_data[tag] = vals[:n_od]
             else:
                 self.context_data[tag] = [0.0] * n_od
 
-        # ── Build 1 Hz historical buffer ─────────────────────────────────────
+        # ── 1 Hz OD historical buffer ─────────────────────────────────────────
         self.od_hist = []
         self.ts_hist = []
         self._hist_current_sec = None
         self._hist_vals = []
+        self._hist_ctx_vals = {}
         try:
             df_h = pd.DataFrame({"t": self.ts_dt, "od": self.od})
             df_h["t"] = pd.to_datetime(df_h["t"])
@@ -164,16 +165,37 @@ class DataStore:
         except Exception:
             pass
 
+        # ── 1 Hz context historical buffer (resampled from context_data) ──────
+        self.ctx_hist = {tag: [] for tag in CONTEXT_TAGS}
+        try:
+            if self.ts_dt and len(self.ts_dt) == len(self.od):
+                df_ctx = pd.DataFrame({"t": pd.to_datetime(self.ts_dt)})
+                for tag in CONTEXT_TAGS:
+                    vals = self.context_data.get(tag, [])
+                    if len(vals) == len(self.od):
+                        df_ctx[tag] = vals
+                df_ctx = df_ctx.set_index("t")
+                df_r   = df_ctx.resample("1s").median().reset_index()
+                n = len(self.ts_hist)
+                for tag in CONTEXT_TAGS:
+                    if tag in df_r.columns:
+                        self.ctx_hist[tag] = df_r[tag].tolist()[:n]
+                    else:
+                        self.ctx_hist[tag] = [0.0] * n
+        except Exception:
+            pass
+
         try:
             v = self.od
-            status(f"Loaded: rows={len(v)}  min={min(v):.6g}  max={max(v):.6g}  mean={sum(v)/len(v):.6g}")
+            status(f"Loaded: rows={len(v)}  min={min(v):.4g}  "
+                   f"max={max(v):.4g}  mean={sum(v)/len(v):.4g}")
         except Exception:
             pass
 
         if self.model is not None and app is not None:
             self.auto_classify(window_size=self.window_size)
 
-    # ── Secondary / correlation helpers ───────────────────────────────────────
+    # ── Secondary / correlation ────────────────────────────────────────────────
 
     def _align_series(self, df_main, tcol_main, ycol_main, df_sec, tcol_sec, ycol_sec):
         m = pd.DataFrame({
@@ -184,15 +206,11 @@ class DataStore:
             "t":   pd.to_datetime(df_sec[tcol_sec], errors="coerce"),
             "sec": self._smart_to_numeric(df_sec[ycol_sec]),
         }).dropna()
-
-        for col in ["t"]:
-            for df in [m, s]:
-                try:   df[col] = df[col].dt.tz_convert(None)
-                except: df[col] = df[col].dt.tz_localize(None)
-
+        for df in [m, s]:
+            try:   df["t"] = df["t"].dt.tz_convert(None)
+            except: df["t"] = df["t"].dt.tz_localize(None)
         m = m.sort_values("t")
         s = s.sort_values("t")
-
         tol = pd.Timedelta(seconds=1)
         if len(m) >= 3:
             dtm = m["t"].diff().dropna().median() or pd.Timedelta(seconds=1)
@@ -200,7 +218,6 @@ class DataStore:
         if len(s) >= 3:
             dts = s["t"].diff().dropna().median() or pd.Timedelta(seconds=1)
             tol = max(tol, dts)
-
         paired = pd.merge_asof(m, s, on="t", direction="nearest", tolerance=tol)
         return paired.dropna().reset_index(drop=True)[["t", "od", "sec"]]
 
@@ -212,37 +229,30 @@ class DataStore:
         ext = os.path.splitext(self.path.lower())[1]
         if ext not in [".xlsx", ".xls"]:
             raise ValueError("Secondary sheet loading only works with Excel files.")
-
-        df_dict  = pd.read_excel(self.path, sheet_name=[sheet_name, "YS_Pullout1_Act_Speed_fpm"])
-        df_sec   = df_dict[sheet_name]
+        df_dict = pd.read_excel(
+            self.path, sheet_name=[sheet_name, "YS_Pullout1_Act_Speed_fpm"])
+        df_sec = df_dict[sheet_name]
         if df_sec is None or df_sec.empty:
             raise ValueError(f"Sheet '{sheet_name}' is empty.")
-
-        filtered_dict    = self.filter_by_speed(df_dict)
-        df_sec_filtered  = filtered_dict[sheet_name]
-        cols_s           = list(df_sec_filtered.columns)
-        tcol_s           = pick(cols_s, SECONDARY_COL_GUESSES["time"]) or "t_stamp"
-        ycol_s           = pick(cols_s, SECONDARY_COL_GUESSES["val"])  or "Tag_value"
-
+        filtered = self.filter_by_speed(df_dict)
+        df_sec_f = filtered[sheet_name]
+        cols_s   = list(df_sec_f.columns)
+        tcol_s   = pick(cols_s, SECONDARY_COL_GUESSES["time"]) or "t_stamp"
+        ycol_s   = pick(cols_s, SECONDARY_COL_GUESSES["val"])  or "Tag_value"
         if tcol_s not in cols_s:
-            raise ValueError(f"Could not find time column in '{sheet_name}'. Columns: {cols_s}")
+            raise ValueError(f"No time column in '{sheet_name}'. Columns: {cols_s}")
         if ycol_s not in cols_s:
-            raise ValueError(f"Could not find value column in '{sheet_name}'. Columns: {cols_s}")
-
-        df_dict_od       = pd.read_excel(self.path,
-                                          sheet_name=["NDC_System_OD_Value",
-                                                      "YS_Pullout1_Act_Speed_fpm"])
-        filtered_dict_od = self.filter_by_speed(df_dict_od)
-        df_main_filtered = filtered_dict_od["NDC_System_OD_Value"]
-
-        paired = self._align_series(df_main_filtered, "t_stamp", "Tag_value",
-                                    df_sec_filtered,  tcol_s,    ycol_s)
+            raise ValueError(f"No value column in '{sheet_name}'. Columns: {cols_s}")
+        df_od     = pd.read_excel(
+            self.path, sheet_name=["NDC_System_OD_Value", "YS_Pullout1_Act_Speed_fpm"])
+        df_main_f = self.filter_by_speed(df_od)["NDC_System_OD_Value"]
+        paired = self._align_series(
+            df_main_f, "t_stamp", "Tag_value", df_sec_f, tcol_s, ycol_s)
         if paired.empty:
             raise ValueError(
-                f"No overlapping timestamps between OD and '{sheet_name}' after speed filtering.")
-
+                f"No overlapping timestamps between OD and '{sheet_name}'.")
         self.paired_df = paired
-        status(f"Secondary loaded & aligned: {sheet_name} • paired rows={len(self.paired_df)}")
+        status(f"Secondary loaded: {sheet_name} * paired rows={len(paired)}")
 
     def corr_stats(self, max_lag_samples: int = 300):
         if self.paired_df is None or self.paired_df.empty:
@@ -254,8 +264,7 @@ class DataStore:
             return {"n": n, "pearson_r": np.nan, "best_lag": 0, "r_at_best_lag": np.nan}
         r0 = float(np.corrcoef(x, y)[0, 1])
         best_r, best_k = r0, 0
-        K = min(max_lag_samples, n - 2)
-        for k in range(1, K + 1):
+        for k in range(1, min(max_lag_samples, n - 2) + 1):
             r_pos = float(np.corrcoef(x[k:], y[:-k])[0, 1])
             if r_pos > best_r: best_r, best_k = r_pos, +k
             r_neg = float(np.corrcoef(x[:-k], y[k:])[0, 1])
@@ -263,7 +272,7 @@ class DataStore:
         return {"n": n, "pearson_r": r0, "best_lag": best_k, "r_at_best_lag": best_r}
 
     def _paired_ok(self):
-        return (self.paired_df is not None) and (not self.paired_df.empty)
+        return self.paired_df is not None and not self.paired_df.empty
 
     def lag_corr_curve(self, max_lag_samples=300):
         if not self._paired_ok(): return np.array([]), np.array([])
@@ -277,7 +286,7 @@ class DataStore:
         for i, k in enumerate(lags):
             if k < 0:   r[i] = np.corrcoef(x[:k],  y[-k:])[0, 1]
             elif k > 0: r[i] = np.corrcoef(x[k:],  y[:-k])[0, 1]
-            else:       r[i] = np.corrcoef(x,       y)[0, 1]
+            else:       r[i] = np.corrcoef(x,       y     )[0, 1]
         return lags, r
 
     def rolling_corr(self, win_samples=200, step=10):
@@ -290,16 +299,15 @@ class DataStore:
         if n < max(10, win_samples): return np.array([]), np.array([])
         mids, rr = [], []
         for i0 in range(0, n - win_samples + 1, step):
-            i1   = i0 + win_samples
-            segx, segy = x[i0:i1], y[i0:i1]
-            r    = (float(np.corrcoef(segx, segy)[0, 1])
-                    if np.std(segx) > 1e-12 and np.std(segy) > 1e-12
-                    else np.nan)
+            i1 = i0 + win_samples
+            sx, sy = x[i0:i1], y[i0:i1]
+            r = (float(np.corrcoef(sx, sy)[0, 1])
+                 if np.std(sx) > 1e-12 and np.std(sy) > 1e-12 else np.nan)
             mids.append(t[i0 + win_samples // 2])
             rr.append(r)
         return np.array(mids), np.array(rr)
 
-    # ── Classification helpers ─────────────────────────────────────────────────
+    # ── Classification ────────────────────────────────────────────────────────
 
     def current_class(self):
         if not self.classes:
@@ -307,14 +315,9 @@ class DataStore:
         return self.classes[-1]["label"], self.classes[-1]["risk"]
 
     def _is_hybrid_model(self) -> bool:
-        """True when the loaded model is a HybridChatterNet (has a context MLP branch)."""
         return getattr(self.model, "is_hybrid", False) or hasattr(self.model, "mlp")
 
-    def _build_context_vector(self, local_start: int, local_end: int) -> list[float]:
-        """
-        Per-window context feature vector: mean of each CONTEXT_TAG over [local_start, local_end).
-        Returns a list of length N_CONTEXT; missing tags are filled with 0.
-        """
+    def _build_context_vector(self, local_start: int, local_end: int) -> list:
         vec = []
         for tag in CONTEXT_TAGS:
             data = self.context_data.get(tag, [])
@@ -327,23 +330,8 @@ class DataStore:
         return vec
 
     def _cnn_infer(self, windows_list, context_list=None):
-        """
-        Run the loaded model over a list of raw OD windows.
-        Each OD window is z-score normalised per-sample (matches training).
-
-        For HybridChatterNet (detected via is_hybrid attribute):
-          - context_list must be a list of float vectors, one per window
-          - stored ctx_mean / ctx_std are applied automatically
-
-        Returns ndarray shape (N, 2) for HybridChatterNet
-                or (N, num_classes) for legacy ChatterCNN.
-        Column index 1 = chatter probability in both cases.
-        """
         import torch
-
         self.model.eval()
-
-        # ── Prepare OD tensor ────────────────────────────────────────────────
         segs = []
         for w in windows_list:
             seg = np.asarray(w, dtype=np.float32)
@@ -351,19 +339,15 @@ class DataStore:
             seg = (seg - mu) / (sigma + 1e-8)
             segs.append(seg)
         X = torch.tensor(np.stack(segs), dtype=torch.float32).unsqueeze(1)
-
         with torch.no_grad():
             if self._is_hybrid_model() and context_list is not None:
-                # ── Hybrid path ──────────────────────────────────────────────
-                ctx = np.array(context_list, dtype=np.float32)   # (N, N_CONTEXT)
-                # Apply stored normalizer
+                ctx      = np.array(context_list, dtype=np.float32)
                 ctx_mean = np.asarray(self.model.ctx_mean, dtype=np.float32)
                 ctx_std  = np.asarray(self.model.ctx_std,  dtype=np.float32)
-                ctx = (ctx - ctx_mean) / (ctx_std + 1e-8)
-                X_ctx = torch.tensor(ctx, dtype=torch.float32)
+                ctx      = (ctx - ctx_mean) / (ctx_std + 1e-8)
+                X_ctx    = torch.tensor(ctx, dtype=torch.float32)
                 return self.model(X, X_ctx).numpy()
             else:
-                # ── Pure CNN path (backward-compatible) ──────────────────────
                 return self.model(X).numpy()
 
     def get_label_from_risk_prob(self, risk):
@@ -373,15 +357,13 @@ class DataStore:
 
     def auto_classify(self, window_size=60):
         if self.model is None:
-            status("No model selected. Please select a model first.")
-            return
-        if window_size is None or window_size <= 0:
-            status("Invalid window size.")
-            return
+            status("No model selected."); return
+        if not window_size or window_size <= 0:
+            status("Invalid window size."); return
         if len(self.od) < window_size:
             return
 
-        total_abs  = len(self.od) + self._trim_offset
+        total_abs   = len(self.od) + self._trim_offset
         num_windows = total_abs // window_size
 
         if self.classes and (
@@ -390,49 +372,115 @@ class DataStore:
         ):
             self.classes = []
 
-        already_classified = len(self.classes)
-        if already_classified >= num_windows:
+        already = len(self.classes)
+        if already >= num_windows:
             return
 
-        windows      = []
-        context_list = []
-        window_meta  = []
-
+        windows, ctx_list, meta = [], [], []
         use_hybrid = self._is_hybrid_model()
 
-        for i in range(already_classified, num_windows):
-            abs_start   = i * window_size
-            abs_end     = abs_start + window_size
-            local_start = abs_start - self._trim_offset
-            local_end   = abs_end   - self._trim_offset
-            if local_start < 0 or local_end > len(self.od):
+        for i in range(already, num_windows):
+            abs_s = i * window_size
+            abs_e = abs_s + window_size
+            loc_s = abs_s - self._trim_offset
+            loc_e = abs_e - self._trim_offset
+            if loc_s < 0 or loc_e > len(self.od):
                 continue
-            windows.append(self.od[local_start:local_end])
+            windows.append(self.od[loc_s:loc_e])
             if use_hybrid:
-                context_list.append(self._build_context_vector(local_start, local_end))
-            window_meta.append((abs_start, abs_end, local_start, local_end))
+                ctx_list.append(self._build_context_vector(loc_s, loc_e))
+            meta.append((abs_s, abs_e, loc_s, loc_e))
 
         if not windows:
             return
 
         probas = self._cnn_infer(
             windows,
-            context_list if (use_hybrid and context_list) else None
+            ctx_list if (use_hybrid and ctx_list) else None
         )
 
-        for i, (abs_start, abs_end, local_start, local_end) in enumerate(window_meta):
-            chatter_confidence = float(probas[i][1])
+        for i, (abs_s, abs_e, loc_s, loc_e) in enumerate(meta):
+            risk = float(probas[i][1])
             self.classes.append({
-                "start": self.ts[local_start],
-                "end":   self.ts[local_end - 1],
-                "label": self.get_label_from_risk_prob(chatter_confidence),
-                "i0":    abs_start,
-                "i1":    abs_end,
-                "risk":  chatter_confidence,
+                "start": self.ts[loc_s],
+                "end":   self.ts[loc_e - 1],
+                "label": self.get_label_from_risk_prob(risk),
+                "i0":    abs_s,
+                "i1":    abs_e,
+                "risk":  risk,
             })
 
         self._classified_with_model = self.model
-        status(f"Auto-classes computed: {len(self.classes)}")
+        status(f"Auto-classes: {len(self.classes)}")
+
+    # ── Explainability ────────────────────────────────────────────────────────
+
+    def explain_last_window(self) -> dict | None:
+        """
+        Gradient x input attribution for the MLP context branch of the most
+        recently classified window.
+
+        Returns None if:
+          - model is not HybridChatterNet
+          - no windows classified yet
+          - PyTorch unavailable
+
+        Return dict:
+            tags          list[str]    CONTEXT_TAGS
+            raw_values    list[float]  un-normalised per-window feature means
+            attributions  list[float]  signed: positive pushes toward chatter
+            grads         list[float]  raw gradient (sign = direction of risk)
+            chatter_prob  float        model chatter probability for this window
+        """
+        if not _TORCH_OK:
+            return None
+        if not self._is_hybrid_model() or not self.classes or not self.od:
+            return None
+
+        try:
+            import torch
+
+            last  = self.classes[-1]
+            loc_s = last["i0"] - self._trim_offset
+            loc_e = last["i1"] - self._trim_offset
+            if loc_s < 0 or loc_e > len(self.od):
+                return None
+
+            # OD tensor — no gradient tracking needed for the CNN branch
+            seg = np.asarray(self.od[loc_s:loc_e], dtype=np.float32)
+            mu, sigma = seg.mean(), seg.std()
+            seg = (seg - mu) / (sigma + 1e-8)
+            X   = torch.tensor(seg, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+
+            # Context tensor — we want d(chatter_prob)/d(X_ctx)
+            ctx_vec  = self._build_context_vector(loc_s, loc_e)
+            ctx      = np.array(ctx_vec, dtype=np.float32)
+            ctx_mean = np.asarray(self.model.ctx_mean, dtype=np.float32)
+            ctx_std  = np.asarray(self.model.ctx_std,  dtype=np.float32)
+            ctx_norm = (ctx - ctx_mean) / (ctx_std + 1e-8)
+
+            X_ctx = torch.tensor(ctx_norm, dtype=torch.float32).unsqueeze(0)
+            X_ctx.requires_grad_(True)
+
+            self.model.eval()
+            # Must NOT use torch.no_grad() here — we need the autograd graph for X_ctx
+            out = self.model(X, X_ctx)
+            out[0, 1].backward()   # differentiate chatter probability
+
+            grads        = X_ctx.grad[0].detach().numpy().copy()
+            attributions = (grads * ctx_norm).tolist()  # gradient x input
+
+            self.model.zero_grad()  # housekeeping
+
+            return {
+                "tags":         list(CONTEXT_TAGS),
+                "raw_values":   ctx_vec,
+                "attributions": attributions,
+                "grads":        grads.tolist(),
+                "chatter_prob": float(out[0, 1].detach()),
+            }
+        except Exception:
+            return None
 
     # ── Math helpers ──────────────────────────────────────────────────────────
 
@@ -440,13 +488,13 @@ class DataStore:
     def _linreg_slope(y):
         n = len(y)
         if n < 2: return 0.0
-        sx   = n * (n - 1) / 2.0
-        sxx  = n * (n - 1) * (2 * n - 1) / 6.0
-        sy   = sum(y)
-        sxy  = sum(i * yi for i, yi in enumerate(y))
-        denom = n * sxx - sx * sx
-        if abs(denom) < 1e-12: return 0.0
-        return (n * sxy - sx * sy) / denom
+        sx  = n * (n - 1) / 2.0
+        sxx = n * (n - 1) * (2 * n - 1) / 6.0
+        sy  = sum(y)
+        sxy = sum(i * yi for i, yi in enumerate(y))
+        d   = n * sxx - sx * sx
+        if abs(d) < 1e-12: return 0.0
+        return (n * sxy - sx * sy) / d
 
     def recent_window(self, n=1024):
         if not self.od: return []
@@ -456,13 +504,12 @@ class DataStore:
         y = self.recent_window(n)
         return self._linreg_slope(y) if y else 0.0
 
-    # ── Sample append (keeps context in sync) ─────────────────────────────────
+    # ── Sample append ─────────────────────────────────────────────────────────
 
-    def _append_sample(self, ts_dt, od, context: dict | None = None):
+    def _append_sample(self, ts_dt, od, context=None):
         self.ts_dt.append(ts_dt)
         self.ts.append(str(ts_dt))
         self.od.append(float(od))
-
         for tag in CONTEXT_TAGS:
             lst = self.context_data.setdefault(tag, [])
             lst.append(float(context[tag]) if context and tag in context else 0.0)
@@ -487,23 +534,38 @@ class DataStore:
             except queue.Empty:
                 break
             drained += 1
+            ts, od, speed, ctx = item
 
-            ts, od, speed, ctx = item   # ctx: dict of context tag → float
+            # Update live snapshot for KPI display
+            self.live_snapshot.update(ctx)
+            self.live_snapshot["NDC_System_OD_Value"]       = od
+            self.live_snapshot["YS_Pullout1_Act_Speed_fpm"] = speed or 0.0
 
-            # ── Always maintain 1 Hz historical buffer ────────────────────────
+            # Always maintain 1 Hz historical buffer (OD + context)
             hist_sec = int(ts)
             if self._hist_current_sec is None:
                 self._hist_current_sec = hist_sec
+
             if hist_sec != self._hist_current_sec:
                 if self._hist_vals:
                     self.od_hist.append(float(np.median(self._hist_vals)))
                     self.ts_hist.append(pd.to_datetime(self._hist_current_sec, unit="s"))
+                    for tag in CONTEXT_TAGS:
+                        vals = self._hist_ctx_vals.get(tag, [])
+                        self.ctx_hist.setdefault(tag, []).append(
+                            float(np.median(vals)) if vals else np.nan)
                 self._hist_current_sec = hist_sec
-                self._hist_vals = []
+                self._hist_vals        = []
+                self._hist_ctx_vals    = {}
+
             if speed is not None and speed > 1:
                 self._hist_vals.append(od)
+                if ctx:
+                    for tag in CONTEXT_TAGS:
+                        if tag in ctx:
+                            self._hist_ctx_vals.setdefault(tag, []).append(ctx[tag])
 
-            # ── Non-decimated path ────────────────────────────────────────────
+            # Non-decimated path
             if not getattr(self, "decimate_enabled", False):
                 if speed is None or speed <= 1:
                     continue
@@ -514,7 +576,7 @@ class DataStore:
                 self._decim_speed_ok    = False
                 continue
 
-            # ── Decimated path (≈1 Hz median) ─────────────────────────────────
+            # Decimated path (~1 Hz median)
             sec = int(ts)
             if self._decim_current_sec is None:
                 self._decim_current_sec = sec
@@ -523,16 +585,15 @@ class DataStore:
                 self._decim_speed_ok    = False
 
             if sec != self._decim_current_sec:
-                # Flush previous second
                 if self._decim_speed_ok and self._decim_vals:
-                    ctx_median = {
-                        tag: float(np.median(vals)) if vals else 0.0
-                        for tag, vals in self._decim_ctx_vals.items()
+                    ctx_med = {
+                        tag: float(np.median(v)) if v else 0.0
+                        for tag, v in self._decim_ctx_vals.items()
                     }
                     self._append_sample(
                         pd.to_datetime(self._decim_current_sec, unit="s"),
                         float(np.median(self._decim_vals)),
-                        ctx_median,
+                        ctx_med,
                     )
                 self._decim_current_sec = sec
                 self._decim_vals        = []
@@ -551,7 +612,7 @@ class DataStore:
 
     def start_live(self, url: str):
         if ws_connect is None:
-            raise RuntimeError("websockets is not available. Install `websockets` >= 12.")
+            raise RuntimeError("websockets not available. pip install websockets>=12")
         if self.live_thread and self.live_thread.is_alive():
             return
         self.live_url = url
@@ -570,18 +631,16 @@ class DataStore:
             try:
                 async with ws_connect(self.live_url) as ws:
                     while not self.live_stop.is_set():
-                        msg  = await ws.recv()
-                        data = json.loads(msg)
-                        items    = data.get("samples") or [data]
-                        recv_ts  = time.time()
+                        msg     = await ws.recv()
+                        data    = json.loads(msg)
+                        items   = data.get("samples") or [data]
+                        recv_ts = time.time()
                         for i, item in enumerate(items):
                             od    = float(item.get("NDC_System_OD_Value", "nan"))
                             speed = item.get("YS_Pullout1_Act_Speed_fpm", None)
-                            # Extract all context signals from the message
-                            ctx = {tag: float(item.get(tag, 0.0)) for tag in CONTEXT_TAGS}
-                            # Back-calculate timestamps for batch members
-                            n  = len(items)
-                            ts = recv_ts - (n - 1 - i) * (1.0 / 2400.0)
+                            ctx   = {tag: float(item.get(tag, 0.0)) for tag in CONTEXT_TAGS}
+                            n     = len(items)
+                            ts    = recv_ts - (n - 1 - i) * (1.0 / 2400.0)
                             try:
                                 self.live_queue.put_nowait((ts, od, speed, ctx))
                             except queue.Full:

@@ -35,7 +35,7 @@ except ImportError:
 CONTEXT_TAGS: list[str] = [
     "AirRampPressure_Val",              # ramps linearly with footage → key long-range signal
     "FtCounters_AirRampFootage_Total",  # absolute footage; normalize at inference time
-    "NDC_System_Ovality_Value",         # elevated during chatter
+    # "NDC_System_Ovality_Value",         # elevated during chatter
     "OilHeater_DeliveryTemp_F",
     "OilHeater_ReturnTemp_F",
     "PTs_PT_300_Val",
