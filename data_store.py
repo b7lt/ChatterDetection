@@ -1,5 +1,11 @@
+import asyncio
+import importlib
+import json
+import math
 import os
-import threading, asyncio, json, queue, time
+import queue
+import threading
+import time
 
 import numpy as np
 import pandas as pd
@@ -11,14 +17,41 @@ except Exception:
 
 try:
     import torch
-    import torch.nn as nn
     _TORCH_OK = True
 except ImportError:
     _TORCH_OK = False
 
-from config import SECONDARY_COL_GUESSES, pick
+from config import (
+    FOOTAGE_TAG,
+    HISTORY_SAMPLE_LIMIT,
+    LIVE_QUEUE_DRAIN_LIMIT,
+    LIVE_QUEUE_MAX,
+    LIVE_SAMPLE_LIMIT,
+    LIVE_SAMPLE_TRIM_TO,
+    OD_TAG,
+    PRESSURE_TAG,
+    RUNNING_FOOTAGE_MIN,
+    RUNNING_PRESSURE_MIN,
+    RUNNING_SPEED_MIN,
+    SECONDARY_COL_GUESSES,
+    SEGMENT_FOOTAGE_RESET_DROP,
+    SEGMENT_IDLE_AFTER_SECONDS,
+    SPEED_TAG_CANDIDATES,
+    pick,
+)
 from status_bar import status
-from models import CONTEXT_TAGS, N_CONTEXT
+from models import CONTEXT_TAGS
+
+
+try:
+    importlib.import_module("python_calamine")
+    _XL_ENGINE = "calamine"
+except ImportError:
+    _XL_ENGINE = "openpyxl"
+
+
+class ModelInputError(ValueError):
+    """Raised when a selected model cannot consume the current dashboard inputs."""
 
 
 class DataStore:
@@ -27,7 +60,7 @@ class DataStore:
         self.ts = []
         self.ts_dt = []
         self.od = []
-        self.od_hist = []       # 1 Hz downsampled OD, never trimmed
+        self.od_hist = []       # 1 Hz downsampled OD, capped separately
         self.ts_hist = []       # pd.Timestamp per od_hist sample
         self.ctx_hist: dict = {tag: [] for tag in CONTEXT_TAGS}
                                 # 1 Hz downsampled context, parallel to od_hist/ts_hist
@@ -40,17 +73,29 @@ class DataStore:
 
         # Latest values of every field arriving over WebSocket, for KPI display
         self.live_snapshot: dict = {}
+        self.segment_state = "idle"
+        self.current_segment_id = 0
+        self.segment_started_at = None
+        self.segment_last_seen_at = None
+        self.segment_start_footage = None
+        self.segment_current_footage = None
+        self.segment_current_pressure = None
+        self._last_segment_footage = None
 
         self.model = None
         self.window_size = None
         self._classified_with_model = None
+        self.last_inference_error = ""
+        self._blocked_inference_key = None
 
         self.available_sheets = []
 
         self.live_url = "ws://localhost:6467"
         self.live_thread = None
         self.live_stop = threading.Event()
-        self.live_queue = queue.Queue(maxsize=10000)
+        self.live_queue = queue.Queue(maxsize=LIVE_QUEUE_MAX)
+        self.live_dropped = 0
+        self.live_rejected = 0
 
         self._decim_current_sec = None
         self._decim_vals = []
@@ -66,26 +111,35 @@ class DataStore:
         self.decimate_enabled = False
 
         self._trim_offset = 0
-        self._MAX_LIVE = 500_000
-        self._TRIM_TO  = 400_000
+        self._MAX_LIVE = LIVE_SAMPLE_LIMIT
+        self._TRIM_TO = LIVE_SAMPLE_TRIM_TO
+        self._MAX_HISTORY = HISTORY_SAMPLE_LIMIT
 
     # ── File I/O ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _excel_file(path: str):
+        return pd.ExcelFile(path, engine=_XL_ENGINE)
+
+    @staticmethod
+    def _read_excel(path: str, sheet_name, **kwargs):
+        return pd.read_excel(path, sheet_name=sheet_name, engine=_XL_ENGINE, **kwargs)
 
     def _read_any_table(self, path: str, sheet=None):
         ext = os.path.splitext(path.lower())[1]
         if ext in [".xlsx", ".xls"]:
             if sheet is None:
-                return pd.read_excel(path, sheet_name=None, parse_dates=[0])
+                return self._read_excel(path, sheet_name=None, parse_dates=[0])
             else:
-                xl = pd.ExcelFile(path)
-                available = set(xl.sheet_names)
-                sheets_to_read = [sheet, "YS_Pullout1_Act_Speed_fpm"]
-                for tag in CONTEXT_TAGS:
+                with self._excel_file(path) as xl:
+                    available = set(xl.sheet_names)
+                sheets_to_read = [sheet]
+                for tag in self._segment_signal_sheets(available) + list(CONTEXT_TAGS):
                     if tag in available:
                         sheets_to_read.append(tag)
                 seen = set()
                 unique = [s for s in sheets_to_read if not (s in seen or seen.add(s))]
-                return pd.read_excel(path, sheet_name=unique, parse_dates=[0])
+                return self._read_excel(path, sheet_name=unique, parse_dates=[0])
 
     def _smart_to_numeric(self, series):
         s = series.copy()
@@ -102,9 +156,52 @@ class DataStore:
             s = s.str.replace(",", "", regex=False)
         return pd.to_numeric(s, errors="coerce")
 
-    def filter_by_speed(self, df_dict):
-        speed_df      = df_dict["YS_Pullout1_Act_Speed_fpm"]
-        valid_indices = speed_df[speed_df["Tag_value"] > 1].index
+    @staticmethod
+    def _segment_signal_sheets(available: set | None = None):
+        names = list(SPEED_TAG_CANDIDATES) + [FOOTAGE_TAG, PRESSURE_TAG]
+        if available is not None:
+            names = [name for name in names if name in available]
+        seen = set()
+        return [name for name in names if not (name in seen or seen.add(name))]
+
+    @staticmethod
+    def _first_available(names, mapping):
+        return next((name for name in names if name in mapping), None)
+
+    def _running_indices(self, df_dict):
+        masks = []
+
+        speed_tag = self._first_available(SPEED_TAG_CANDIDATES, df_dict)
+        if speed_tag:
+            speed = self._smart_to_numeric(df_dict[speed_tag]["Tag_value"])
+            masks.append(speed > RUNNING_SPEED_MIN)
+
+        if FOOTAGE_TAG in df_dict:
+            footage = self._smart_to_numeric(df_dict[FOOTAGE_TAG]["Tag_value"])
+            footage_delta = footage.diff().fillna(0)
+            masks.append((footage > RUNNING_FOOTAGE_MIN) | (footage_delta > 0))
+
+        if PRESSURE_TAG in df_dict:
+            pressure = self._smart_to_numeric(df_dict[PRESSURE_TAG]["Tag_value"])
+            masks.append(pressure > RUNNING_PRESSURE_MIN)
+
+        if not masks:
+            return None
+
+        valid = masks[0].fillna(False)
+        for mask in masks[1:]:
+            valid = valid | mask.fillna(False)
+        return valid[valid].index
+
+    def filter_by_running_state(self, df_dict):
+        valid_indices = self._running_indices(df_dict)
+        if valid_indices is None:
+            return {
+                sheet_name: df.reset_index(drop=True)
+                for sheet_name, df in df_dict.items()
+                if len(df) > 0
+            }
+
         filtered = {}
         for sheet_name, df in df_dict.items():
             if len(df) == 0:
@@ -119,20 +216,21 @@ class DataStore:
 
         ext = os.path.splitext(path.lower())[1]
         if ext in [".xlsx", ".xls"]:
-            self.available_sheets = pd.ExcelFile(path).sheet_names
+            with self._excel_file(path) as xl:
+                self.available_sheets = xl.sheet_names
         else:
             self.available_sheets = []
 
-        df_dict = self._read_any_table(path, "NDC_System_OD_Value")
+        df_dict = self._read_any_table(path, OD_TAG)
         if df_dict is None or len(df_dict) == 0:
             raise ValueError("Empty file.")
 
-        filtered = self.filter_by_speed(df_dict)
+        filtered = self.filter_by_running_state(df_dict)
 
-        self.od    = filtered["NDC_System_OD_Value"]["Tag_value"].tolist()
-        self.ts    = filtered["NDC_System_OD_Value"]["t_stamp"].astype(str).tolist()
+        self.od    = filtered[OD_TAG]["Tag_value"].tolist()
+        self.ts    = filtered[OD_TAG]["t_stamp"].astype(str).tolist()
         self.ts_dt = pd.to_datetime(
-            filtered["NDC_System_OD_Value"]["t_stamp"], errors="coerce").tolist()
+            filtered[OD_TAG]["t_stamp"], errors="coerce").tolist()
         self.classes      = []
         self._trim_offset = 0
 
@@ -184,6 +282,7 @@ class DataStore:
                         self.ctx_hist[tag] = [0.0] * n
         except Exception:
             pass
+        self._trim_history()
 
         try:
             v = self.od
@@ -229,12 +328,18 @@ class DataStore:
         ext = os.path.splitext(self.path.lower())[1]
         if ext not in [".xlsx", ".xls"]:
             raise ValueError("Secondary sheet loading only works with Excel files.")
-        df_dict = pd.read_excel(
-            self.path, sheet_name=[sheet_name, "YS_Pullout1_Act_Speed_fpm"])
+
+        with self._excel_file(self.path) as xl:
+            available = set(xl.sheet_names)
+        sheets = [sheet_name, OD_TAG] + self._segment_signal_sheets(available)
+        seen = set()
+        sheets = [s for s in sheets if s in available and not (s in seen or seen.add(s))]
+        df_dict = self._read_excel(self.path, sheet_name=sheets, parse_dates=[0])
         df_sec = df_dict[sheet_name]
         if df_sec is None or df_sec.empty:
             raise ValueError(f"Sheet '{sheet_name}' is empty.")
-        filtered = self.filter_by_speed(df_dict)
+
+        filtered = self.filter_by_running_state(df_dict)
         df_sec_f = filtered[sheet_name]
         cols_s   = list(df_sec_f.columns)
         tcol_s   = pick(cols_s, SECONDARY_COL_GUESSES["time"]) or "t_stamp"
@@ -243,9 +348,7 @@ class DataStore:
             raise ValueError(f"No time column in '{sheet_name}'. Columns: {cols_s}")
         if ycol_s not in cols_s:
             raise ValueError(f"No value column in '{sheet_name}'. Columns: {cols_s}")
-        df_od     = pd.read_excel(
-            self.path, sheet_name=["NDC_System_OD_Value", "YS_Pullout1_Act_Speed_fpm"])
-        df_main_f = self.filter_by_speed(df_od)["NDC_System_OD_Value"]
+        df_main_f = filtered[OD_TAG]
         paired = self._align_series(
             df_main_f, "t_stamp", "Tag_value", df_sec_f, tcol_s, ycol_s)
         if paired.empty:
@@ -329,6 +432,49 @@ class DataStore:
                 vec.append(0.0)
         return vec
 
+    def _validate_context_shape(self, context_list):
+        if context_list is None:
+            raise ModelInputError(
+                "The selected model expects context inputs, but no context "
+                "vectors were available for inference."
+            )
+
+        ctx = np.asarray(context_list, dtype=np.float32)
+        if ctx.ndim != 2:
+            raise ModelInputError(
+                f"Context input must be 2-D, got shape {ctx.shape}."
+            )
+
+        model_mean = getattr(self.model, "ctx_mean", None)
+        model_std = getattr(self.model, "ctx_std", None)
+        if model_mean is None or model_std is None:
+            raise ModelInputError(
+                "The selected hybrid model is missing ctx_mean/ctx_std. "
+                "Retrain or resave it with the current training pipeline."
+            )
+
+        ctx_mean = np.asarray(model_mean, dtype=np.float32).reshape(-1)
+        ctx_std = np.asarray(model_std, dtype=np.float32).reshape(-1)
+        if len(ctx_mean) != len(ctx_std):
+            raise ModelInputError(
+                f"The selected model has inconsistent context normalizer sizes "
+                f"(ctx_mean={len(ctx_mean)}, ctx_std={len(ctx_std)})."
+            )
+
+        actual = ctx.shape[1]
+        expected = len(ctx_mean)
+        if actual != expected:
+            tags = ", ".join(CONTEXT_TAGS)
+            raise ModelInputError(
+                "The selected model was trained with a different number of "
+                f"context variables. Model expects {expected}; the dashboard "
+                f"is providing {actual}. Current context tags: {tags}. Use a "
+                "model trained with this context tag set, or update CONTEXT_TAGS "
+                "to match the model."
+            )
+
+        return ctx, ctx_mean, ctx_std
+
     def _cnn_infer(self, windows_list, context_list=None):
         import torch
         self.model.eval()
@@ -340,10 +486,8 @@ class DataStore:
             segs.append(seg)
         X = torch.tensor(np.stack(segs), dtype=torch.float32).unsqueeze(1)
         with torch.no_grad():
-            if self._is_hybrid_model() and context_list is not None:
-                ctx      = np.array(context_list, dtype=np.float32)
-                ctx_mean = np.asarray(self.model.ctx_mean, dtype=np.float32)
-                ctx_std  = np.asarray(self.model.ctx_std,  dtype=np.float32)
+            if self._is_hybrid_model():
+                ctx, ctx_mean, ctx_std = self._validate_context_shape(context_list)
                 ctx      = (ctx - ctx_mean) / (ctx_std + 1e-8)
                 X_ctx    = torch.tensor(ctx, dtype=torch.float32)
                 return self.model(X, X_ctx).numpy()
@@ -355,12 +499,16 @@ class DataStore:
         elif risk < 0.70: return "Mild Chatter"
         else:             return "Heavy Chatter"
 
-    def auto_classify(self, window_size=60):
+    def auto_classify(self, window_size=60, raise_errors=False):
         if self.model is None:
             status("No model selected."); return
         if not window_size or window_size <= 0:
             status("Invalid window size."); return
         if len(self.od) < window_size:
+            return
+
+        inference_key = (id(self.model), int(window_size))
+        if not raise_errors and self._blocked_inference_key == inference_key:
             return
 
         total_abs   = len(self.od) + self._trim_offset
@@ -372,14 +520,18 @@ class DataStore:
         ):
             self.classes = []
 
-        already = len(self.classes)
-        if already >= num_windows:
+        if self.classes:
+            next_window = max(c["i1"] for c in self.classes) // window_size
+        else:
+            next_window = (self._trim_offset + window_size - 1) // window_size
+
+        if next_window >= num_windows:
             return
 
         windows, ctx_list, meta = [], [], []
         use_hybrid = self._is_hybrid_model()
 
-        for i in range(already, num_windows):
+        for i in range(next_window, num_windows):
             abs_s = i * window_size
             abs_e = abs_s + window_size
             loc_s = abs_s - self._trim_offset
@@ -394,10 +546,22 @@ class DataStore:
         if not windows:
             return
 
-        probas = self._cnn_infer(
-            windows,
-            ctx_list if (use_hybrid and ctx_list) else None
-        )
+        try:
+            probas = self._cnn_infer(
+                windows,
+                ctx_list if use_hybrid else None
+            )
+            self.last_inference_error = ""
+            self._blocked_inference_key = None
+        except (ModelInputError, RuntimeError, ValueError) as exc:
+            self.last_inference_error = str(exc)
+            self._blocked_inference_key = inference_key
+            status(f"Model input mismatch: {exc}")
+            if raise_errors:
+                if isinstance(exc, ModelInputError):
+                    raise
+                raise ModelInputError(str(exc)) from exc
+            return
 
         for i, (abs_s, abs_e, loc_s, loc_e) in enumerate(meta):
             risk = float(probas[i][1])
@@ -520,26 +684,136 @@ class DataStore:
             del self.ts[:excess]
             del self.ts_dt[:excess]
             for lst in self.context_data.values():
-                if len(lst) > excess:
-                    del lst[:excess]
+                del lst[:excess]
             self._trim_offset += excess
+            self._trim_class_windows()
+
+    def _append_history_sample(self, ts_sec: int, od_values: list, ctx_values: dict):
+        self.od_hist.append(float(np.median(od_values)))
+        self.ts_hist.append(pd.to_datetime(ts_sec, unit="s"))
+        for tag in CONTEXT_TAGS:
+            vals = ctx_values.get(tag, [])
+            self.ctx_hist.setdefault(tag, []).append(
+                float(np.median(vals)) if vals else np.nan)
+        self._trim_history()
+
+    def _trim_class_windows(self):
+        if self.classes:
+            self.classes = [
+                span for span in self.classes
+                if span.get("i1", 0) > self._trim_offset
+            ]
+
+    def _trim_history(self):
+        if self._MAX_HISTORY <= 0 or len(self.od_hist) <= self._MAX_HISTORY:
+            return
+        excess = len(self.od_hist) - self._MAX_HISTORY
+        del self.od_hist[:excess]
+        del self.ts_hist[:excess]
+        for vals in self.ctx_hist.values():
+            del vals[:excess]
+
+    # ── Segment tracking ─────────────────────────────────────────────────────
+
+    def _start_segment(self, ts: float, footage):
+        self.current_segment_id += 1
+        self.segment_state = "running"
+        self.segment_started_at = ts
+        self.segment_last_seen_at = ts
+        self.segment_start_footage = footage
+
+    def _stop_segment(self):
+        self.segment_state = "idle"
+        self.segment_last_seen_at = None
+        self.segment_start_footage = None
+
+    def _update_segment_state(self, ts: float, signals: dict) -> bool:
+        speed = self._first_available_value(SPEED_TAG_CANDIDATES, signals)
+        footage = signals.get(FOOTAGE_TAG)
+        pressure = signals.get(PRESSURE_TAG)
+
+        footage_reset = (
+            footage is not None
+            and self._last_segment_footage is not None
+            and footage + SEGMENT_FOOTAGE_RESET_DROP < self._last_segment_footage
+        )
+
+        if footage_reset:
+            self._stop_segment()
+
+        evidence = False
+        if speed is not None:
+            evidence = speed > RUNNING_SPEED_MIN
+        else:
+            if footage is not None:
+                if self._last_segment_footage is None:
+                    evidence = footage > RUNNING_FOOTAGE_MIN
+                else:
+                    evidence = (footage - self._last_segment_footage) > 0
+            if pressure is not None:
+                last_pressure = self.segment_current_pressure
+                pressure_rising = (
+                    last_pressure is not None
+                    and (pressure - last_pressure) > 0
+                )
+                evidence = evidence or pressure_rising
+                if self.segment_state == "idle":
+                    evidence = evidence or pressure > RUNNING_PRESSURE_MIN
+
+        if evidence:
+            if self.segment_state != "running":
+                self._start_segment(ts, footage)
+            else:
+                self.segment_last_seen_at = ts
+        elif (
+            self.segment_state == "running"
+            and self.segment_last_seen_at is not None
+            and ts - self.segment_last_seen_at >= SEGMENT_IDLE_AFTER_SECONDS
+        ):
+            self._stop_segment()
+
+        if footage is not None:
+            self.segment_current_footage = footage
+            self._last_segment_footage = footage
+        if pressure is not None:
+            self.segment_current_pressure = pressure
+
+        return self.segment_state == "running"
+
+    @staticmethod
+    def _first_available_value(names, mapping):
+        for name in names:
+            value = mapping.get(name)
+            if value is not None:
+                return value
+        return None
+
+    def _segment_snapshot_values(self, signals: dict):
+        snapshot = {
+            "segment_state": self.segment_state,
+            "current_segment_id": self.current_segment_id,
+        }
+        snapshot.update(signals)
+        return snapshot
 
     # ── Live queue consumer ────────────────────────────────────────────────────
 
     def _consume_live_queue(self):
         drained = 0
-        while True:
+        while drained < LIVE_QUEUE_DRAIN_LIMIT:
             try:
                 item = self.live_queue.get_nowait()
             except queue.Empty:
                 break
             drained += 1
-            ts, od, speed, ctx = item
+            ts, od, signals, ctx = item
+            running = self._update_segment_state(ts, signals)
 
             # Update live snapshot for KPI display
             self.live_snapshot.update(ctx)
-            self.live_snapshot["NDC_System_OD_Value"]       = od
-            self.live_snapshot["YS_Pullout1_Act_Speed_fpm"] = speed or 0.0
+            self.live_snapshot[OD_TAG] = od
+            for tag, value in self._segment_snapshot_values(signals).items():
+                self.live_snapshot[tag] = value
 
             # Always maintain 1 Hz historical buffer (OD + context)
             hist_sec = int(ts)
@@ -548,17 +822,16 @@ class DataStore:
 
             if hist_sec != self._hist_current_sec:
                 if self._hist_vals:
-                    self.od_hist.append(float(np.median(self._hist_vals)))
-                    self.ts_hist.append(pd.to_datetime(self._hist_current_sec, unit="s"))
-                    for tag in CONTEXT_TAGS:
-                        vals = self._hist_ctx_vals.get(tag, [])
-                        self.ctx_hist.setdefault(tag, []).append(
-                            float(np.median(vals)) if vals else np.nan)
+                    self._append_history_sample(
+                        self._hist_current_sec,
+                        self._hist_vals,
+                        self._hist_ctx_vals,
+                    )
                 self._hist_current_sec = hist_sec
                 self._hist_vals        = []
                 self._hist_ctx_vals    = {}
 
-            if speed is not None and speed > 1:
+            if running:
                 self._hist_vals.append(od)
                 if ctx:
                     for tag in CONTEXT_TAGS:
@@ -567,7 +840,7 @@ class DataStore:
 
             # Non-decimated path
             if not getattr(self, "decimate_enabled", False):
-                if speed is None or speed <= 1:
+                if not running:
                     continue
                 self._append_sample(pd.to_datetime(ts, unit="s"), od, ctx)
                 self._decim_current_sec = None
@@ -600,7 +873,7 @@ class DataStore:
                 self._decim_ctx_vals    = {}
                 self._decim_speed_ok    = False
 
-            if speed is not None and speed > 1:
+            if running:
                 self._decim_speed_ok = True
                 self._decim_vals.append(od)
                 for tag, val in ctx.items():
@@ -609,6 +882,56 @@ class DataStore:
         return drained
 
     # ── WebSocket live feed ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _as_float(value, default=None):
+        if value is None:
+            return default
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return default
+        return out if math.isfinite(out) else default
+
+    @staticmethod
+    def _timestamp_seconds(value, fallback: float):
+        if value in (None, ""):
+            return fallback
+        numeric = DataStore._as_float(value)
+        if numeric is not None:
+            # Treat large millisecond epochs as milliseconds, otherwise seconds.
+            return numeric / 1000.0 if numeric > 10_000_000_000 else numeric
+        try:
+            parsed = pd.to_datetime(value, errors="coerce", utc=True)
+            if pd.isna(parsed):
+                return fallback
+            return parsed.timestamp()
+        except Exception:
+            return fallback
+
+    def _live_segment_signals(self, item: dict, ctx: dict):
+        signals = {}
+        for tag in self._segment_signal_sheets():
+            value = self._as_float(item.get(tag), default=None)
+            if value is None and tag in ctx:
+                value = self._as_float(ctx.get(tag), default=None)
+            if value is not None:
+                signals[tag] = value
+        return signals
+
+    def _parse_live_item(self, item: dict, fallback_ts: float):
+        od = self._as_float(item.get(OD_TAG))
+        if od is None:
+            self.live_rejected += 1
+            return None
+
+        ctx = {
+            tag: self._as_float(item.get(tag), default=0.0)
+            for tag in CONTEXT_TAGS
+        }
+        signals = self._live_segment_signals(item, ctx)
+        ts = self._timestamp_seconds(item.get("t_stamp"), fallback=fallback_ts)
+        return ts, od, signals, ctx
 
     def start_live(self, url: str):
         if ws_connect is None:
@@ -631,20 +954,20 @@ class DataStore:
             try:
                 async with ws_connect(self.live_url) as ws:
                     while not self.live_stop.is_set():
-                        msg     = await ws.recv()
-                        data    = json.loads(msg)
-                        items   = data.get("samples") or [data]
+                        msg = await ws.recv()
+                        data = json.loads(msg)
+                        items = data.get("samples") or [data]
                         recv_ts = time.time()
                         for i, item in enumerate(items):
-                            od    = float(item.get("NDC_System_OD_Value", "nan"))
-                            speed = item.get("YS_Pullout1_Act_Speed_fpm", None)
-                            ctx   = {tag: float(item.get(tag, 0.0)) for tag in CONTEXT_TAGS}
-                            n     = len(items)
-                            ts    = recv_ts - (n - 1 - i) * (1.0 / 2400.0)
+                            n = len(items)
+                            fallback_ts = recv_ts - (n - 1 - i) * (1.0 / 2400.0)
+                            parsed = self._parse_live_item(item, fallback_ts)
+                            if parsed is None:
+                                continue
                             try:
-                                self.live_queue.put_nowait((ts, od, speed, ctx))
+                                self.live_queue.put_nowait(parsed)
                             except queue.Full:
-                                pass
+                                self.live_dropped += 1
             except Exception:
                 await asyncio.sleep(0.5)
 

@@ -16,6 +16,7 @@ from matplotlib.figure import Figure
 from widgets import BasePage
 from status_bar import status
 from models import CONTEXT_TAGS, N_CONTEXT
+from config import RUNNING_SPEED_MIN, SPEED_TAG_CANDIDATES
 
 # Optional dependencies
 try:
@@ -55,6 +56,24 @@ _VALUE_COLS = ("tag_value", "value", "od", "ovality", "tag_val")
 _ARCH_CHOICES = ["ChatterCNN (OD only)", "HybridChatterNet (OD + context)"]
 
 
+def _is_finite_number(value) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _first_numeric_value(mapping, names):
+    for name in names:
+        if name not in mapping:
+            continue
+        try:
+            return float(mapping[name])
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 # ── Training Page ─────────────────────────────────────────────────────────────
 
 class TrainingPage(BasePage):
@@ -86,6 +105,9 @@ class TrainingPage(BasePage):
         self._windows   = []
         self._drag_x    = None
         self._drag_rect = None
+        self._user_view_active = False
+        self._saved_xlim = None
+        self._saved_ylim = None
         self._model     = None
         self._training  = False
 
@@ -206,10 +228,13 @@ class TrainingPage(BasePage):
         tb_frm.grid(row=1, column=0, sticky="ew")
         self._toolbar = NavigationToolbar2Tk(self._canvas, tb_frm)
         self._toolbar.update()
+        self._patch_toolbar_home()
 
         self._canvas.mpl_connect("button_press_event",   self._on_press)
         self._canvas.mpl_connect("motion_notify_event",  self._on_drag)
         self._canvas.mpl_connect("button_release_event", self._on_release)
+        self._canvas.mpl_connect("button_release_event", self._on_toolbar_release)
+        self._canvas.mpl_connect("scroll_event",         self._remember_current_view)
         self._init_plot()
 
         # ── right panel ───────────────────────────────────────────────────────
@@ -365,6 +390,10 @@ class TrainingPage(BasePage):
         if len(combined) == 0:
             return
 
+        saved_xlim = self._saved_xlim
+        saved_ylim = self._saved_ylim
+        restore_view = self._user_view_active and saved_xlim and saved_ylim
+
         self._ax.clear()
         self._ax.set_visible(True)
 
@@ -405,17 +434,90 @@ class TrainingPage(BasePage):
             f"win sz = {self._ws_size.get():,}",
             fontsize=10)
         self._ax.grid(True, alpha=0.2, linewidth=0.5)
+        if restore_view:
+            try:
+                self._ax.set_xlim(saved_xlim)
+                self._ax.set_ylim(saved_ylim)
+            except Exception:
+                self._clear_saved_view()
         self._fig.tight_layout(pad=1.5)
         self._canvas.draw_idle()
 
     # ── Mouse interaction ─────────────────────────────────────────────────────
 
+    def _toolbar_mode_name(self) -> str:
+        try:
+            mode = self._toolbar.mode
+        except Exception:
+            return ""
+        if not mode:
+            return ""
+        name = str(mode).lower()
+        return "" if name in {"none", "_mode.none"} else name
+
     def _toolbar_active(self) -> bool:
-        try:    return bool(self._toolbar.mode)
-        except: return False
+        return bool(self._toolbar_mode_name())
+
+    def _remember_current_view(self, *_):
+        if not self._sources:
+            return
+        self._user_view_active = True
+        self._saved_xlim = self._ax.get_xlim()
+        self._saved_ylim = self._ax.get_ylim()
+
+    def _clear_saved_view(self):
+        self._user_view_active = False
+        self._saved_xlim = None
+        self._saved_ylim = None
+
+    def _reset_original_view(self):
+        self._clear_saved_view()
+        self._redraw_plot()
+        try:
+            self._toolbar.update()
+        except Exception:
+            pass
+
+    def _patch_toolbar_home(self):
+        def _home_wrapper(*args, **kwargs):
+            self._reset_original_view()
+
+        try:
+            self._toolbar.home = _home_wrapper
+            btn = (getattr(self._toolbar, "_buttons", {}).get("home")
+                   or getattr(self._toolbar, "_buttons", {}).get("Home"))
+            if btn is not None:
+                btn.configure(command=_home_wrapper)
+        except Exception:
+            pass
+
+    def _on_toolbar_release(self, event):
+        mode = self._toolbar_mode_name()
+        if not mode:
+            return
+
+        def _finish():
+            self._remember_current_view()
+            active = self._toolbar_mode_name()
+            try:
+                if "zoom rect" in active or "zoom to rect" in active:
+                    self._toolbar.zoom()
+            except Exception:
+                pass
+            try:
+                self._toolbar.update()
+            except Exception:
+                pass
+
+        # Let Matplotlib apply the zoom/pan limits before we save them.
+        self.after_idle(_finish)
 
     def _on_press(self, event):
-        if event.inaxes is not self._ax or self._toolbar_active(): return
+        if event.inaxes is not self._ax:
+            return
+        if self._toolbar_active():
+            status("Toolbar navigation active; release to return to labeling.")
+            return
         if event.button == 1:
             self._drag_x = event.xdata
 
@@ -723,14 +825,15 @@ class TrainingPage(BasePage):
                         data  = json.loads(msg)
                         items = data.get("samples") or [data]
                         for item in items:
-                            speed = item.get("YS_Pullout1_Act_Speed_fpm")
-                            if speed is not None and speed <= 1:
+                            speed = _first_numeric_value(item, SPEED_TAG_CANDIDATES)
+                            if speed is not None and speed <= RUNNING_SPEED_MIN:
                                 continue
                             numeric = {
                                 k: float(v)
                                 for k, v in item.items()
-                                if k != "t_stamp" and isinstance(v, (int, float))
-                                and not math.isnan(float(v))
+                                if k != "t_stamp"
+                                and isinstance(v, (int, float, str))
+                                and _is_finite_number(v)
                             }
                             if numeric:
                                 try:   self._live_q.put_nowait(numeric)

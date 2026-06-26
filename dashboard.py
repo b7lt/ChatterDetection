@@ -16,16 +16,24 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("1400x850"); self.minsize(1120, 720)
+        self.geometry("1400x850")
+        self.minsize(1120, 720)
 
-        self._init_style(); self._init_menu()
+        self._init_style()
+        self._init_menu()
 
-        root = ttk.Frame(self); root.pack(fill="both", expand=True)
-        root.columnconfigure(0, weight=0); root.columnconfigure(1, weight=1); root.rowconfigure(0, weight=1)
+        root = ttk.Frame(self)
+        root.pack(fill="both", expand=True)
+        root.columnconfigure(0, weight=0)
+        root.columnconfigure(1, weight=1)
+        root.rowconfigure(0, weight=1)
 
-        sidebar = self._build_sidebar(root); sidebar.grid(row=0, column=0, sticky="nsw")
-        self.container = ttk.Frame(root, padding=(12, 16, 16, 16)); self.container.grid(row=0, column=1, sticky="nsew")
-        self.container.columnconfigure(0, weight=1); self.container.rowconfigure(0, weight=1)
+        sidebar = self._build_sidebar(root)
+        sidebar.grid(row=0, column=0, sticky="nsw")
+        self.container = ttk.Frame(root, padding=(12, 16, 16, 16))
+        self.container.grid(row=0, column=1, sticky="nsew")
+        self.container.columnconfigure(0, weight=1)
+        self.container.rowconfigure(0, weight=1)
 
         self.pages = {
             "Data":     DataPage(self.container),
@@ -34,7 +42,8 @@ class App(tk.Tk):
             "Live":      LivePage(self.container),
             "History":  HistoryPage(self.container),
         }
-        for p in self.pages.values(): p.grid(row=0, column=0, sticky="nsew")
+        for page in self.pages.values():
+            page.grid(row=0, column=0, sticky="nsew")
         self.show("Live")
 
         self._build_statusbar()
@@ -46,8 +55,10 @@ class App(tk.Tk):
 
     def _init_style(self):
         self.style = ttk.Style(self)
-        try: self.style.theme_use("clam")
-        except tk.TclError: pass
+        try:
+            self.style.theme_use("clam")
+        except tk.TclError:
+            pass
         self.style.configure("Sidebar.TFrame",      background="#111827")
         self.style.configure("Sidebar.TButton",     foreground="white", background="#1F2937")
         self.style.map("Sidebar.TButton",            background=[("active", "#374151")])
@@ -76,13 +87,15 @@ class App(tk.Tk):
 
     def _build_statusbar(self):
         App._status_var = tk.StringVar(value="Ready")
-        status_bar._var = App._status_var   # wire up the global status bridge
-        bar = ttk.Frame(self); bar.pack(side="bottom", fill="x")
+        status_bar._var = App._status_var
+        bar = ttk.Frame(self)
+        bar.pack(side="bottom", fill="x")
         ttk.Label(bar, textvariable=App._status_var, padding=8).pack(side="left")
         ttk.Label(bar, text=datetime.now().strftime("%Y-%m-%d"), padding=8).pack(side="right")
 
     def show(self, page_name: str):
-        self.pages[page_name].tkraise(); self.status(f"Showing {page_name}")
+        self.pages[page_name].tkraise()
+        self.status(f"Showing {page_name}")
 
     @classmethod
     def status(cls, msg: str):

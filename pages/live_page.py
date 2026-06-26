@@ -11,6 +11,7 @@ from widgets import BasePage, Gauge
 from pages.live import LiveTimeSeries
 from data_store import DATA
 from models import CONTEXT_TAGS
+from config import FOOTAGE_TAG, OD_TAG, PRESSURE_TAG
 
 
 # ── Display metadata ──────────────────────────────────────────────────────────
@@ -37,9 +38,11 @@ _TAG_UNITS = {
 
 # Segment KPI strip: (dict_key, display_label, format_spec, snapshot_key, unit)
 _KPI_DEFS = [
-    ("footage",  "Section Footage",   ".0f", "FtCounters_AirRampFootage_Total", "ft"),
-    ("pressure", "Air Ramp Pressure", ".3f", "AirRampPressure_Val",             "PSI"),
-    ("od",       "Current OD",        ".5f", "NDC_System_OD_Value",             "in"),
+    ("segment",  "Segment",           "s",   "current_segment_id",              ""),
+    ("state",    "State",             "s",   "segment_state",                   ""),
+    ("footage",  "Section Footage",   ".0f", FOOTAGE_TAG,                      "ft"),
+    ("pressure", "Air Ramp Pressure", ".3f", PRESSURE_TAG,                     "PSI"),
+    ("od",       "Current OD",        ".5f", OD_TAG,                           "in"),
     ("ovality",  "Ovality",           ".5f", "NDC_System_Ovality_Value",        "in"),
     ("oil_temp", "Oil Deliv. Temp",   ".1f", "OilHeater_DeliveryTemp_F",        "°F"),
     ("pt300",    "PT-300",            ".2f", "PTs_PT_300_Val",                  "PSI"),
@@ -172,6 +175,8 @@ class LivePage(BasePage):
                 v = d[-1] if d else None
             if v is None or (isinstance(v, float) and np.isnan(v)):
                 return "—"
+            if fmt == "s":
+                return str(v).title() if src_key == "segment_state" else str(v)
             try:
                 return format(float(v), fmt)
             except (ValueError, TypeError):

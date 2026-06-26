@@ -6,6 +6,7 @@ from tkinter import ttk, filedialog, messagebox
 from widgets import BasePage
 from data_store import DATA
 from status_bar import status
+from config import OD_TAG, FOOTAGE_TAG, PRESSURE_TAG, SPEED_TAG_CANDIDATES
 
 
 class DataPage(BasePage):
@@ -50,6 +51,7 @@ class DataPage(BasePage):
         ttk.Checkbutton(controls, text="Decimate live data to 1 Hz (median)", variable=self.decimate_var).grid(
             row=1, column=4, sticky="w", pady=(6, 0), padx=(8, 0))
 
+        self._last_live_counters = (0, 0)
         self.after(200, self._poll_live_queue)
 
     def load_xlsx(self):
@@ -63,7 +65,7 @@ class DataPage(BasePage):
             DATA.load_data(path, app=app_instance)
             self.info.config(text=f"Loaded: {os.path.basename(path)}  •  rows={len(DATA.od)}")
 
-            excluded = ['NDC_System_OD_Value', 'YS_Pullout1_Act_Speed_fpm']
+            excluded = [OD_TAG, FOOTAGE_TAG, PRESSURE_TAG] + list(SPEED_TAG_CANDIDATES)
             available = [s for s in DATA.available_sheets if s not in excluded]
 
             if available:
@@ -119,6 +121,13 @@ class DataPage(BasePage):
 
     def _poll_live_queue(self):
         got = DATA._consume_live_queue()
+        counters = (DATA.live_dropped, DATA.live_rejected)
+        if counters != self._last_live_counters:
+            self._last_live_counters = counters
+            status(
+                f"Live feed: {DATA.live_dropped} dropped, "
+                f"{DATA.live_rejected} rejected sample(s)"
+            )
         if got and DATA.model is not None and DATA.window_size and len(DATA.od) >= DATA.window_size:
             now = time.time()
             if not hasattr(self, "_last_cls_ts") or now - self._last_cls_ts >= 1.0:
